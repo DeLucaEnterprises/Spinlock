@@ -1,0 +1,14 @@
+name = "spinlock"
+main = "src/worker/index.js"
+compatibility_date = "2025-04-01"
+
+# Frontend is plain HTML/CSS/JS in ./public — no build step.
+# The Worker serves API routes itself and falls through to ASSETS for everything else.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Meta Model API key is NEVER in this file or in the repo.
+# Set it as a Worker secret:
+#   npx wrangler secret put META_API_KEY
+# For local dev only, copy .dev.vars.example to .dev.vars (gitignored) — never commit .dev.vars.

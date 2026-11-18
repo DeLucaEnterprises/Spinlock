@@ -1,0 +1,1328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPINLOCK — Lock onto every degree of airtime</title>
+<meta name="description" content="SPINLOCK: snowboard rotation analysis. SAM 3.1 segments the board, board-axis geometry builds the rotation curve, Muse Spark 1.3 verifies the trick.">
+<link rel="icon" href="/spinlock-logo.png">
+<style>
+  :root{
+    --red:#e10600; --red-bright:#ff2a1f; --red-dark:#8f0400;
+    --ink:#0a0a0c; --panel:#141416; --panel2:#1c1c20; --line:#2c2c32;
+    --steel:#c8c8ce; --steel-dim:#8a8a94; --white:#f5f5f7;
+    --green:#22c55e; --amber:#f59e0b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--ink);color:var(--white);
+    font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 16px 48px}
+  /* ---------- Top bar ---------- */
+  .topbar{display:flex;align-items:center;gap:14px;padding:14px 0 10px;border-bottom:3px solid var(--red)}
+  .topbar img.logo{width:64px;height:64px;border-radius:50%;border:2px solid var(--red);object-fit:cover;flex:0 0 auto;background:#000}
+  .brand h1{margin:0;font-size:34px;line-height:1;letter-spacing:.06em;font-weight:900;font-style:italic}
+  .brand h1 span{color:var(--red-bright)}
+  .brand p{margin:4px 0 0;color:var(--steel);letter-spacing:.22em;text-transform:uppercase;font-size:11px;font-weight:700}
+  .health{margin-left:auto;text-align:right}
+  .badge{display:inline-block;padding:7px 12px;font-weight:900;letter-spacing:.08em;font-size:13px;
+    border:2px solid var(--steel-dim);background:#222;color:var(--steel);text-transform:uppercase}
+  .badge.live{border-color:var(--green);color:#bbf7d0;background:#0b2e16}
+  .badge.down{border-color:var(--red);color:#fecaca;background:#2b0a08}
+  .health small{display:block;color:var(--steel-dim);margin-top:6px;font-size:12px}
+  .health button{margin-top:6px}
+  /* ---------- Banner / tabs ---------- */
+  .banner{display:none;margin:14px 0;padding:14px 16px;border:2px solid var(--amber);background:#241a05;color:#fde68a}
+  .banner.show{display:block}
+  .banner b{color:#fff}
+  .banner p{margin:6px 0 0;font-size:14px;line-height:1.5}
+  .tabs{display:flex;gap:8px;margin:16px 0}
+  .tab{flex:1;padding:12px;font-size:15px;font-weight:900;letter-spacing:.1em;text-transform:uppercase;
+    background:var(--panel);color:var(--steel);border:2px solid var(--line);cursor:pointer}
+  .tab[aria-selected="true"]{background:var(--red);border-color:var(--red);color:#fff}
+  /* ---------- Panels ---------- */
+  .panel{background:var(--panel);border:1px solid var(--line);padding:18px;margin-bottom:16px}
+  .panel h2{margin:0 0 4px;font-size:20px;letter-spacing:.06em;text-transform:uppercase;font-weight:900;font-style:italic}
+  .panel h2 em{color:var(--red-bright);font-style:italic}
+  .hint{color:var(--steel-dim);font-size:13px;line-height:1.5;margin:6px 0 0}
+  label{display:block;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--steel);margin:14px 0 6px}
+  input[type="text"],input[type="url"],input[type="number"]{width:100%;padding:11px 12px;font-size:15px;
+    background:#0d0d0f;color:#fff;border:1px solid var(--line);border-radius:0}
+  input[type="file"]{width:100%;padding:10px;background:#0d0d0f;border:1px dashed var(--line);color:var(--steel)}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row>*{flex:1 1 200px}
+  button{font:inherit;cursor:pointer;border-radius:0}
+  .btn{display:inline-block;padding:12px 18px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;font-size:14px;
+    border:2px solid transparent;background:var(--panel2);color:#fff}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn-primary{background:var(--red);border-color:var(--red)}
+  .btn-primary:hover:not(:disabled){background:var(--red-bright)}
+  .btn-ghost{background:transparent;border-color:var(--steel-dim);color:var(--steel)}
+  .btn-danger{background:transparent;border-color:var(--red);color:#fca5a5}
+  .btn-sm{padding:8px 12px;font-size:12px}
+  video{width:100%;max-height:420px;background:#000;display:block;border:1px solid var(--line)}
+  .video-wrap{position:relative;margin-top:12px}
+  .live-dot{position:absolute;top:10px;left:10px;background:var(--red);color:#fff;font-weight:900;font-size:12px;
+    letter-spacing:.14em;padding:5px 9px;display:none}
+  .live-dot.show{display:block}
+  /* ---------- Progress / errors ---------- */
+  .progress{display:none;margin-top:14px;border:1px solid var(--line);padding:12px;background:#0d0d0f}
+  .progress.show{display:block}
+  .progress .stage{font-weight:800;letter-spacing:.04em}
+  .progress .meta{color:var(--steel-dim);font-size:13px;margin-top:4px;font-variant-numeric:tabular-nums}
+  .bar{height:10px;background:#26262b;margin-top:10px}
+  .bar>i{display:block;height:100%;background:var(--red);width:0%;transition:width .2s}
+  .error{display:none;margin-top:14px;padding:12px 14px;border:2px solid var(--red);background:#220806;color:#fecaca;font-size:14px;line-height:1.55}
+  .error.show{display:block}
+  .error b{color:#fff}
+  .note{display:none;margin-top:14px;padding:12px 14px;border:1px solid var(--line);background:#0d0d0f;color:var(--steel);font-size:14px;line-height:1.55}
+  .note.show{display:block}
+  /* ---------- Results ---------- */
+  .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:14px 0}
+  @media (max-width:760px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:#0d0d0f;border:1px solid var(--line);border-top:3px solid var(--red);padding:12px 10px;text-align:center}
+  .stat .v{font-size:30px;font-weight:900;font-variant-numeric:tabular-nums;line-height:1.1}
+  .stat .v small{font-size:15px;color:var(--steel-dim)}
+  .stat .k{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--steel-dim);margin-top:6px;font-weight:800}
+  .verdict{display:flex;gap:14px;align-items:center;flex-wrap:wrap;border:2px solid var(--line);padding:14px;background:#0d0d0f;margin:14px 0}
+  .verdict .call{font-size:28px;font-weight:900;letter-spacing:.06em;padding:8px 14px}
+  .call.LOCKED{background:var(--green);color:#04150a}
+  .call.CLOSE{background:var(--amber);color:#241a05}
+  .call.DISPUTED{background:var(--red);color:#fff}
+  .call.UNVERIFIED{background:#333;color:var(--steel)}
+  .verdict .detail{font-size:14px;line-height:1.55;color:var(--steel)}
+  .verdict .detail b{color:#fff}
+  .dial-grid{display:grid;grid-template-columns:280px 1fr;gap:16px;align-items:start}
+  @media (max-width:760px){.dial-grid{grid-template-columns:1fr}}
+  .dial-box{background:#0d0d0f;border:1px solid var(--line);padding:12px;text-align:center}
+  .dial-box .deg{font-size:40px;font-weight:900;font-variant-numeric:tabular-nums}
+  .dial-box .sub{color:var(--steel-dim);font-size:12px;letter-spacing:.14em;text-transform:uppercase;font-weight:800}
+  canvas.chart{width:100%;height:180px;background:#0d0d0f;border:1px solid var(--line);display:block}
+  .strip{display:flex;gap:8px;overflow-x:auto;padding:10px 2px}
+  .frame-card{flex:0 0 118px;background:#0d0d0f;border:1px solid var(--line);cursor:pointer}
+  .frame-card.sel{border-color:var(--red);outline:2px solid var(--red)}
+  .frame-card img{width:100%;height:66px;object-fit:cover;display:block;background:#000}
+  .frame-card .fmeta{padding:6px 8px;font-size:11px;line-height:1.5;font-variant-numeric:tabular-nums}
+  .frame-card .miss{color:var(--amber)}
+  .frame-card .found{color:#86efac}
+  /* ---------- Run sheet ---------- */
+  table.runs{width:100%;border-collapse:collapse;font-size:14px}
+  table.runs th{text-align:left;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--steel-dim);padding:8px;border-bottom:2px solid var(--line)}
+  table.runs td{padding:10px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+  table.runs tr[data-status="failed"] td:first-child{border-left:4px solid var(--red)}
+  table.runs tr[data-status="complete"] td:first-child{border-left:4px solid var(--green)}
+  .empty{color:var(--steel-dim);font-size:14px;line-height:1.6}
+  footer{border-top:1px solid var(--line);margin-top:8px;padding-top:14px;color:var(--steel-dim);font-size:12.5px;line-height:1.6}
+  footer b{color:var(--steel)}
+  .sr{position:absolute;left:-9999px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="topbar">
+    <img class="logo" src="/spinlock-logo.png" alt="SPINLOCK logo — snowboarder mid-spin inside a padlock dial">
+    <div class="brand">
+      <h1>SPIN<span>LOCK</span></h1>
+      <p>Lock onto every degree of airtime</p>
+    </div>
+    <div class="health">
+      <span id="healthBadge" class="badge">● Model check…</span>
+      <small id="healthNote">Checking Meta models…</small><br>
+      <button id="healthRetry" class="btn btn-ghost btn-sm" type="button">Retry check</button>
+    </div>
+  </header>
+
+  <div id="healthBanner" class="banner" role="alert">
+    <b>Models unreachable — scanning is paused.</b>
+    <p id="healthBannerText">SPINLOCK could not reach the Meta Model API. Scans will not start until the models answer, so you will never sit in a fake “scanning” state. The check retries automatically every 30 seconds — or tap Retry check above. The real error from the last check is shown below.</p>
+    <p><code id="healthError" style="word-break:break-word"></code></p>
+  </div>
+
+  <nav class="tabs" role="tablist" aria-label="SPINLOCK modes">
+    <button class="tab" role="tab" id="tabBtnClip" aria-selected="true" data-tab="clip" type="button">Clip analysis</button>
+    <button class="tab" role="tab" id="tabBtnLive" aria-selected="false" data-tab="live" type="button">Live camera</button>
+    <button class="tab" role="tab" id="tabBtnRuns" aria-selected="false" data-tab="runs" type="button">Run sheet</button>
+  </nav>
+
+  <!-- ============ CLIP ============ -->
+  <section id="tab-clip" role="tabpanel" aria-labelledby="tabBtnClip">
+    <div class="panel">
+      <h2>Clip <em>analysis</em></h2>
+      <p class="hint">Upload a clip <b>or</b> paste a direct video-file link. SPINLOCK finds the trick itself — takeoff, airtime, landing — then measures the rotation. No scrubbing required. Manual window controls are available as an override.</p>
+
+      <label for="fileInput">1 · Upload a clip (MP4 / WebM / MOV)</label>
+      <input id="fileInput" type="file" accept="video/*,.mp4,.webm,.mov">
+
+      <label for="linkInput">…or 1 · Paste a direct video-file link</label>
+      <input id="linkInput" type="url" inputmode="url" placeholder="https://example.com/trick.mp4">
+      <p class="hint">Direct video files only. YouTube, Vimeo, Instagram, TikTok, Facebook and X links cannot be sampled frame-by-frame in a browser — SPINLOCK will say so plainly and ask you to download the clip and upload the file instead. Direct links also need the host to allow cross-origin reads; if it does not, you will get an honest CORS error, not a hang.</p>
+      <div class="row" style="margin-top:12px">
+        <button id="useLinkBtn" class="btn btn-ghost" type="button">Use this link</button>
+        <button id="clearSourceBtn" class="btn btn-ghost" type="button">Clear source</button>
+      </div>
+
+      <div class="video-wrap">
+        <video id="clipVideo" controls muted playsinline preload="auto" crossorigin="anonymous"></video>
+      </div>
+
+      <div class="row" style="margin-top:14px;align-items:flex-end">
+        <div>
+          <label for="fpsInput">Frame rate for analysis (fps)</label>
+          <input id="fpsInput" type="number" min="4" max="12" step="1" value="8">
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <label style="margin:0;text-transform:none;letter-spacing:0;font-size:14px;font-weight:400;color:var(--white)">
+            <input id="manualToggle" type="checkbox"> Manual window override
+          </label>
+        </div>
+      </div>
+      <div id="manualBox" class="row" style="display:none;margin-top:4px">
+        <div>
+          <label for="manualStart">Window start (seconds)</label>
+          <input id="manualStart" type="number" min="0" step="0.1" value="0">
+        </div>
+        <div>
+          <label for="manualEnd">Window end (seconds)</label>
+          <input id="manualEnd" type="number" min="0" step="0.1" value="0">
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:16px">
+        <button id="autoBtn" class="btn btn-primary" type="button">Find the trick &amp; analyze</button>
+        <button id="cancelBtn" class="btn btn-danger" type="button" style="display:none">Cancel scan</button>
+      </div>
+
+      <div id="clipProgress" class="progress" aria-live="polite">
+        <div class="stage" id="clipStage">Working…</div>
+        <div class="meta" id="clipMeta"></div>
+        <div class="bar"><i id="clipBar"></i></div>
+      </div>
+      <div id="clipError" class="error" role="alert"></div>
+      <div id="clipNote" class="note"></div>
+    </div>
+  </section>
+
+  <!-- ============ LIVE ============ -->
+  <section id="tab-live" role="tabpanel" aria-labelledby="tabBtnLive" hidden>
+    <div class="panel">
+      <h2>Live <em>camera</em></h2>
+      <p class="hint">Point the camera at the jump. Start tracking before drop-in. With auto takeoff/landing on, SPINLOCK learns the snow line, calls both moments itself, and verifies the trick after touchdown. Manual Mark buttons stay as backup. Live analysis uses the same SAM 3.1 + Spark pipeline — if the models are unreachable, tracking will not pretend otherwise.</p>
+      <div class="video-wrap">
+        <video id="liveVideo" autoplay muted playsinline></video>
+        <span id="liveDot" class="live-dot">● TRACKING</span>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button id="camBtn" class="btn btn-ghost" type="button">Start camera</button>
+        <button id="trackBtn" class="btn btn-primary" type="button" disabled>Start tracking</button>
+        <button id="stopTrackBtn" class="btn btn-danger" type="button" disabled>Stop</button>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <label style="margin:0;text-transform:none;letter-spacing:0;font-size:14px;font-weight:400;color:var(--white)">
+          <input id="autoLandToggle" type="checkbox" checked> Auto takeoff / landing detection (recommended)
+        </label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="markTakeoffBtn" class="btn btn-ghost" type="button" disabled>Mark takeoff</button>
+        <button id="markLandingBtn" class="btn btn-ghost" type="button" disabled>Mark landing</button>
+      </div>
+      <div id="liveStats" class="note"></div>
+      <div id="liveError" class="error" role="alert"></div>
+      <div id="liveWarn" class="note"></div>
+      <div class="dial-grid" style="margin-top:14px">
+        <div class="dial-box">
+          <svg id="liveDial" width="220" height="220" viewBox="0 0 220 220" role="img" aria-label="Live rotation dial"></svg>
+          <div class="deg" id="liveDeg">0°</div>
+          <div class="sub">Live rotation</div>
+        </div>
+        <div>
+          <canvas id="liveChart" class="chart" width="640" height="180"></canvas>
+          <p class="hint">Live rotation curve — measured angles only. Gaps mean SAM did not lock the board in that sample.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ RUN SHEET ============ -->
+  <section id="tab-runs" role="tabpanel" aria-labelledby="tabBtnRuns" hidden>
+    <div class="panel">
+      <h2>Run <em>sheet</em></h2>
+      <p class="hint">Runs save in this browser (local storage). Opening a run reloads its measured frames, curve, and verification. Runs stuck in “processing” for over 12 minutes are automatically closed as failed-and-rerunnable — nothing stays spinning forever.</p>
+      <div id="runsEmpty" class="empty">No runs yet. Your first real clip or live session creates the first run. No demo data is shown as analysis.</div>
+      <div style="overflow-x:auto">
+        <table class="runs" id="runsTable" hidden>
+          <thead><tr><th>Run</th><th>Total</th><th>Airtime</th><th>Call</th><th>Status</th><th></th></tr></thead>
+          <tbody id="runsBody"></tbody>
+        </table>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button id="clearRunsBtn" class="btn btn-ghost btn-sm" type="button">Delete all runs</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ RESULTS ============ -->
+  <section id="results" class="panel" hidden>
+    <h2>Run <em>result</em></h2>
+    <p class="hint" id="resultTitle"></p>
+    <div class="stats">
+      <div class="stat"><div class="v" id="statTotal">—</div><div class="k">Total rotation</div></div>
+      <div class="stat"><div class="v" id="statAir">—</div><div class="k">Airtime</div></div>
+      <div class="stat"><div class="v" id="statPeak">—</div><div class="k">Peak spin rate</div></div>
+      <div class="stat"><div class="v" id="statAvg">—</div><div class="k">Avg spin rate</div></div>
+      <div class="stat"><div class="v" id="statFound">—</div><div class="k">Board found</div></div>
+    </div>
+    <div class="verdict">
+      <span id="verdictCall" class="call UNVERIFIED">UNVERIFIED</span>
+      <div class="detail" id="verdictDetail">Verification has not run yet.</div>
+    </div>
+    <div class="dial-grid">
+      <div class="dial-box">
+        <svg id="dial" width="220" height="220" viewBox="0 0 220 220" role="img" aria-label="Rotation dial"></svg>
+        <div class="deg" id="dialDeg">0°</div>
+        <div class="sub">Cumulative rotation · click a frame to scrub</div>
+        <div style="margin-top:10px">
+          <button id="replayBtn" class="btn btn-ghost btn-sm" type="button">Replay frames</button>
+        </div>
+      </div>
+      <div>
+        <canvas id="chart" class="chart" width="640" height="180"></canvas>
+        <p class="hint">Rotation over time. Solid points are measured frames; gaps are frames where SAM did not lock the board. The curve is unwrapped board-axis angle from SAM boxes + pixel moments (single camera — see limits in the footer).</p>
+      </div>
+    </div>
+    <h3 style="margin:18px 0 4px;font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--steel)">Frame strip — per-frame degrees</h3>
+    <div id="frameStrip" class="strip"></div>
+    <div class="row" style="margin-top:14px">
+      <button id="cancelRunBtn" class="btn btn-danger btn-sm" type="button" style="display:none">Cancel this run</button>
+      <button id="rerunBtn" class="btn btn-ghost btn-sm" type="button">Re-run from source</button>
+      <button id="deleteRunBtn" class="btn btn-ghost btn-sm" type="button">Delete this run</button>
+    </div>
+    <div id="resultNote" class="note"></div>
+  </section>
+
+  <footer>
+    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. SAM 3.1 (Meta) segments the snowboard in each frame. Board-axis angle comes from the SAM box plus pixel moments in that box, unwrapped across frames into a rotation curve. Takeoff/landing come from board height against the learned snow line. Muse Spark 1.3 (Meta) then verifies trick name, direction, and total from takeoff / mid-air / landing frames — shown side by side with the measured total. <b>LOCKED</b> means measured and verified totals agree within 45°. <b>CLOSE</b> within 120°. <b>DISPUTED</b> otherwise. No rotation, takeoff, or landing value is ever invented or filled in.
+    <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs.
+  </footer>
+</div>
+<script>
+"use strict";
+/* =====================================================================
+   SPINLOCK frontend — no build step, no external dependencies.
+   All measurement comes from SAM boxes + pixel moments. All verification
+   comes from Muse Spark. Failures are reported, never papered over.
+   ===================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const BATCH = 8;                 // frames per Worker call (server cap)
+const SEEK_TIMEOUT_MS = 5000;    // per-seek budget — a stalled seek must never hang a scan
+const STUCK_RUN_MS = 12 * 60 * 1000;
+const RUNS_KEY = "spinlock.runs.v1";
+const PLATFORM_HOSTS = ["youtube.com", "youtu.be", "vimeo.com", "instagram.com", "tiktok.com", "facebook.com", "fb.watch", "x.com", "twitter.com"];
+
+const state = {
+  health: { status: "checking", ok: false, error: "" },
+  videoURL: null, videoKind: null, videoName: "",
+  currentRunId: null,
+  scanAbort: null,
+  replayTimer: null,
+};
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function fmtDeg(v) { return Number.isFinite(v) ? Math.round(v) + "°" : "—"; }
+function fmtSec(v) { return Number.isFinite(v) ? v.toFixed(2) + "s" : "—"; }
+function fmtRate(v) { return Number.isFinite(v) ? Math.round(v) + "°/s" : "—"; }
+function show(el) { el.classList.add("show"); }
+function hide(el) { el.classList.remove("show"); }
+
+/* ---------------- Tabs ---------------- */
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((b) => b.setAttribute("aria-selected", b === btn ? "true" : "false"));
+    for (const name of ["clip", "live", "runs"]) {
+      $("tab-" + name).hidden = btn.dataset.tab !== name;
+    }
+    if (btn.dataset.tab === "runs") renderRuns();
+  });
+});
+
+/* ---------------- Health gate ---------------- */
+let healthTimer = null;
+async function checkHealth() {
+  const badge = $("healthBadge"), note = $("healthNote");
+  badge.className = "badge";
+  badge.textContent = "● Model check…";
+  note.textContent = "Checking Meta models…";
+  try {
+    const res = await fetch("/api/health", { cache: "no-store", signal: AbortSignal.timeout(20000) });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok && data.sam) {
+      state.health = { status: "live", ok: true, error: "" };
+      badge.className = "badge live";
+      badge.textContent = "● SAM 3.1 + Spark live";
+      note.textContent = `${(data.models || []).length} models on this key · checked ${new Date().toLocaleTimeString()}`;
+      hide($("healthBanner"));
+    } else {
+      const err = data.error || "Model check returned no SAM model.";
+      state.health = { status: "down", ok: false, error: err };
+      badge.className = "badge down";
+      badge.textContent = "● Models unreachable";
+      note.textContent = "Scanning paused · auto-recheck every 30s";
+      $("healthError").textContent = err;
+      show($("healthBanner"));
+    }
+  } catch (err) {
+    state.health = { status: "down", ok: false, error: String((err && err.message) || err) };
+    badge.className = "badge down";
+    badge.textContent = "● Models unreachable";
+    note.textContent = "Scanning paused · auto-recheck every 30s";
+    $("healthError").textContent = state.health.error;
+    show($("healthBanner"));
+  }
+  applyHealthGate();
+}
+function applyHealthGate() {
+  const down = !state.health.ok;
+  $("autoBtn").disabled = down || !state.videoURL;
+  $("trackBtn").disabled = down || !live.stream;
+}
+function startHealthLoop() {
+  checkHealth();
+  if (healthTimer) clearInterval(healthTimer);
+  healthTimer = setInterval(() => { if (state.health.status !== "live") checkHealth(); }, 30000);
+}
+$("healthRetry").addEventListener("click", checkHealth);
+
+/* ---------------- Run sheet (localStorage) ---------------- */
+function loadRuns() {
+  try {
+    const raw = localStorage.getItem(RUNS_KEY);
+    const runs = raw ? JSON.parse(raw) : [];
+    return Array.isArray(runs) ? runs : [];
+  } catch { return []; }
+}
+function saveRuns(runs) {
+  try { localStorage.setItem(RUNS_KEY, JSON.stringify(runs.slice(0, 20))); } catch { /* quota: keep newest, drop oldest */ 
+    try { localStorage.setItem(RUNS_KEY, JSON.stringify(runs.slice(0, 8))); } catch {}
+  }
+}
+function sweepStuckRuns() {
+  const runs = loadRuns();
+  let changed = false;
+  const now = Date.now();
+  for (const run of runs) {
+    if (run.status === "processing" && now - (run.updatedAt || run.createdAt || now) > STUCK_RUN_MS) {
+      run.status = "failed";
+      run.error = "Auto-closed: stuck in processing for over 12 minutes. Safe to re-run.";
+      run.updatedAt = now;
+      changed = true;
+    }
+  }
+  if (changed) saveRuns(runs);
+}
+function upsertRun(run) {
+  const runs = loadRuns().filter((r) => r.id !== run.id);
+  run.updatedAt = Date.now();
+  runs.unshift(run);
+  saveRuns(runs);
+}
+function getRun(id) { return loadRuns().find((r) => r.id === id) || null; }
+function deleteRun(id) { saveRuns(loadRuns().filter((r) => r.id !== id)); }
+
+function renderRuns() {
+  sweepStuckRuns();
+  const runs = loadRuns();
+  $("runsEmpty").style.display = runs.length ? "none" : "block";
+  $("runsTable").hidden = runs.length === 0;
+  const body = $("runsBody");
+  body.innerHTML = "";
+  for (const run of runs) {
+    const tr = document.createElement("tr");
+    tr.dataset.status = run.status || "";
+    tr.innerHTML =
+      `<td><b>${esc(run.title || "Untitled run")}</b><br><small style="color:var(--steel-dim)">${esc(new Date(run.createdAt).toLocaleString())} · ${esc(run.source || "")}</small></td>` +
+      `<td>${run.stats ? fmtDeg(run.stats.total_degrees) : "—"}</td>` +
+      `<td>${run.stats ? fmtSec(run.stats.airtime_s) : "—"}</td>` +
+      `<td>${esc(run.verification ? run.verification.agreement : "—")}</td>` +
+      `<td>${esc(run.status || "")}${run.error ? `<br><small style="color:#fca5a5">${esc(run.error)}</small>` : ""}</td>` +
+      `<td style="white-space:nowrap"><button class="btn btn-ghost btn-sm" data-open="${esc(run.id)}" type="button">Open</button> ` +
+      `<button class="btn btn-ghost btn-sm" data-del="${esc(run.id)}" type="button">Delete</button></td>`;
+    body.appendChild(tr);
+  }
+  body.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => openRun(b.dataset.open)));
+  body.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", () => { deleteRun(b.dataset.del); renderRuns(); }));
+}
+$("clearRunsBtn").addEventListener("click", () => { if (confirm("Delete all saved runs in this browser?")) { saveRuns([]); renderRuns(); } });
+
+function openRun(id) {
+  const run = getRun(id);
+  if (!run) return;
+  state.currentRunId = id;
+  renderResult(run);
+  document.querySelector('[data-tab="clip"]').click();
+  $("results").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+/* ---------------- Video helpers ---------------- */
+function seekTo(video, time) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return; done = true; cleanup();
+      reject(new Error(`Video seek timed out after ${SEEK_TIMEOUT_MS / 1000}s at ${time.toFixed(2)}s — the clip may be slow to decode. Try a shorter clip or a lower frame rate.`));
+    }, SEEK_TIMEOUT_MS);
+    function onSeeked() { if (done) return; done = true; cleanup(); resolve(); }
+    function onError() { if (done) return; done = true; cleanup(); reject(new Error("Video error while seeking (unsupported codec or unreadable file).")); }
+    function cleanup() { clearTimeout(timer); video.removeEventListener("seeked", onSeeked); video.removeEventListener("error", onError); }
+    video.addEventListener("seeked", onSeeked);
+    video.addEventListener("error", onError);
+    try { video.currentTime = Math.min(Math.max(0, time), Math.max(0, (video.duration || 1) - 0.05)); }
+    catch (err) { if (!done) { done = true; cleanup(); reject(err); } }
+  });
+}
+
+function waitForMetadata(video) {
+  return new Promise((resolve, reject) => {
+    if (video.readyState >= 1 && Number.isFinite(video.duration) && video.duration > 0) return resolve();
+    const timer = setTimeout(() => reject(new Error("Timed out waiting for video metadata. The file or link may be unreachable.")), 15000);
+    const ok = () => { clearTimeout(timer); video.removeEventListener("loadedmetadata", ok); video.removeEventListener("error", bad); resolve(); };
+    const bad = () => { clearTimeout(timer); video.removeEventListener("loadedmetadata", ok); video.removeEventListener("error", bad); reject(new Error("Could not load this video (check the file or link).")); };
+    video.addEventListener("loadedmetadata", ok);
+    video.addEventListener("error", bad);
+  });
+}
+
+/**
+ * Extract JPEG frames from a <video> element via canvas.
+ * Throws a CORS error (honestly labelled) if the canvas is tainted.
+ */
+async function extractFrames(video, { fps, maxFrames, signal, onProgress }) {
+  await waitForMetadata(video);
+  const duration = video.duration;
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error("This video has no readable duration.");
+  const count = Math.max(2, Math.min(maxFrames, Math.floor(duration * fps) + 1));
+  const step = duration / count;
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 360;
+  const scale = Math.min(1, 480 / vw);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(2, Math.round(vw * scale));
+  canvas.height = Math.max(2, Math.round(vh * scale));
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const frames = [];
+  for (let i = 0; i < count; i++) {
+    if (signal && signal.aborted) throw new DOMException("Scan cancelled.", "AbortError");
+    const t = Math.min(duration - 0.05, i * step + step / 2);
+    await seekTo(video, t);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    let dataUrl;
+    try {
+      dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+    } catch (err) {
+      throw new Error("CORS blocked: this video host does not allow frame reads. Download the clip and upload the file instead. (Technical detail: " + (err.message || "tainted canvas") + ")");
+    }
+    frames.push({ index: i, time: t, image: dataUrl, width: canvas.width, height: canvas.height });
+    if (onProgress) onProgress(i + 1, count);
+  }
+  return frames;
+}
+
+/* ---------------- Geometry: board-axis angle from SAM box + pixels ---------------- */
+/**
+ * Estimate the board's long-axis angle inside a SAM box by principal-axis
+ * analysis of darker-than-snow pixels. Returns {angleDeg, pixels} or null.
+ * This is a measurement estimate, not a guess: too few pixels => null.
+ */
+function estimateBoardAngle(image, box) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const pad = 0.12;
+        const x0 = Math.max(0, Math.floor((box.x1 - pad * box.w) * img.width));
+        const y0 = Math.max(0, Math.floor((box.y1 - pad * box.h) * img.height));
+        const x1 = Math.min(img.width, Math.ceil((box.x2 + pad * box.w) * img.width));
+        const y1 = Math.min(img.height, Math.ceil((box.y2 + pad * box.h) * img.height));
+        const w = Math.max(1, x1 - x0), h = Math.max(1, y1 - y0);
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        const ctx = c.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, x0, y0, w, h, 0, 0, w, h);
+        const data = ctx.getImageData(0, 0, w, h).data;
+        const pts = [];
+        for (let y = 0; y < h; y += 2) {
+          for (let x = 0; x < w; x += 2) {
+            const k = (y * w + x) * 4;
+            const r = data[k], g = data[k + 1], b = data[k + 2];
+            // Snow is bright in all channels; board/rider/gear is darker.
+            if (r < 185 || g < 185 || b < 185) pts.push([x, y]);
+          }
+        }
+        if (pts.length < 30) return resolve(null);
+        let mx = 0, my = 0;
+        for (const [x, y] of pts) { mx += x; my += y; }
+        mx /= pts.length; my /= pts.length;
+        let sxx = 0, syy = 0, sxy = 0;
+        for (const [x, y] of pts) { const dx = x - mx, dy = y - my; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+        const angle = 0.5 * Math.atan2(2 * sxy, sxx - syy) * 180 / Math.PI;
+        resolve({ angleDeg: angle, pixels: pts.length });
+      } catch { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = image;
+  });
+}
+
+/** Unwrap axis angles (180°-periodic) into a cumulative rotation curve. */
+function unwrapAngles(samples) {
+  // samples: [{time, angleDeg|null}] in time order. Returns cumulative degrees per sample (null where unknown).
+  let cumulative = 0, prev = null, started = false;
+  return samples.map((s) => {
+    if (s.angleDeg == null) return { ...s, cum_deg: started ? cumulative : null };
+    if (prev == null) { prev = s.angleDeg; started = true; return { ...s, cum_deg: 0 }; }
+    let d = s.angleDeg - prev;
+    while (d > 90) d -= 180;
+    while (d < -90) d += 180;
+    cumulative += d;
+    prev = s.angleDeg;
+    return { ...s, cum_deg: cumulative };
+  });
+}
+
+function computeStats(curve, takeoffTime, landingTime) {
+  const measured = curve.filter((p) => p.cum_deg != null);
+  if (measured.length < 2) return null;
+  const first = measured[0].cum_deg, last = measured[measured.length - 1].cum_deg;
+  const total = Math.abs(last - first);
+  const airtime = Math.max(0, landingTime - takeoffTime);
+  const avg = airtime > 0 ? total / airtime : 0;
+  let peak = 0;
+  for (let i = 1; i < measured.length; i++) {
+    const dt = measured[i].time - measured[i - 1].time;
+    if (dt > 0) peak = Math.max(peak, Math.abs(measured[i].cum_deg - measured[i - 1].cum_deg) / dt);
+  }
+  return {
+    total_degrees: total,
+    airtime_s: airtime,
+    peak_rate: peak,
+    avg_rate: avg,
+    direction: (last - first) >= 0 ? "clockwise (as seen)" : "counter-clockwise (as seen)",
+  };
+}
+
+/** Find the airborne stretch from board height vs the learned snow line. */
+function detectWindowFromCy(results) {
+  const found = results.filter((r) => r.found && Number.isFinite(r.cy));
+  if (found.length < 3) {
+    return { window: null, reason: `Only ${found.length} frames locked the board — not enough to find an airborne stretch.` };
+  }
+  const cys = found.map((r) => r.cy).sort((a, b) => a - b);
+  const snowLine = cys[Math.floor(cys.length * 0.9)]; // low in frame = on the snow
+  const airborne = found.filter((r) => r.cy < snowLine - 0.08);
+  if (airborne.length < 2) {
+    return { window: null, snowLine, reason: "No sustained airborne stretch was found — the board never rose clearly above the snow line in the sampled frames. Try the manual window override around the trick." };
+  }
+  const takeoff = airborne[0], landing = airborne[airborne.length - 1];
+  return {
+    window: { start: Math.max(0, takeoff.time - 0.15), end: landing.time + 0.15, takeoffTime: takeoff.time, landingTime: landing.time },
+    snowLine,
+    reason: `Snow line at ${Math.round(snowLine * 100)}% of frame height; board rose above it for ${airborne.length} sampled frames.`,
+  };
+}
+</script>
+<script>
+"use strict";
+/* ---------------- Source handling (clip) ---------------- */
+const clipVideo = $("clipVideo");
+let objectUrl = null;
+
+function setSource(url, kind, name) {
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = kind === "file" ? url : null;
+  state.videoURL = url; state.videoKind = kind; state.videoName = name;
+  clipVideo.src = url;
+  clipVideo.load();
+  hide($("clipError")); hide($("clipNote"));
+  $("clipNote").textContent = "";
+  applyHealthGate();
+  clipVideo.addEventListener("loadedmetadata", () => {
+    if (Number.isFinite(clipVideo.duration)) $("manualEnd").value = clipVideo.duration.toFixed(1);
+  }, { once: true });
+}
+
+$("fileInput").addEventListener("change", (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  setSource(URL.createObjectURL(f), "file", f.name);
+});
+$("clearSourceBtn").addEventListener("click", () => {
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = null; state.videoURL = null; state.videoKind = null; state.videoName = "";
+  clipVideo.removeAttribute("src"); clipVideo.load();
+  $("fileInput").value = ""; $("linkInput").value = "";
+  applyHealthGate();
+});
+$("useLinkBtn").addEventListener("click", () => {
+  const raw = $("linkInput").value.trim();
+  hide($("clipError")); hide($("clipNote"));
+  if (!raw) return showClipError("Paste a video link first.");
+  let parsed;
+  try { parsed = new URL(raw); } catch { return showClipError("That does not look like a valid URL. Paste a direct link to a video file (ending .mp4, .webm, or .mov)."); }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return showClipError("Links must start with http:// or https://.");
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  if (PLATFORM_HOSTS.some((h) => host === h || host.endsWith("." + h))) {
+    return showClipError(
+      "<b>This kind of link cannot be analyzed in a browser.</b> YouTube, Vimeo, Instagram, TikTok, Facebook and X watch pages do not expose raw video frames for sampling — no browser app can do this, not just SPINLOCK. " +
+      "Download the clip (where you have the right to) and upload the file instead. Direct video-file links (ending .mp4 / .webm / .mov) work.");
+  }
+  if (!/\.(mp4|webm|mov)(\?|#|$)/i.test(parsed.pathname)) {
+    $("clipNote").textContent = "Heads up: this link does not end in .mp4 / .webm / .mov. SPINLOCK will try it, but watch pages and playlists usually fail — a direct video-file link is what works.";
+    show($("clipNote"));
+  }
+  setSource(raw, "link", raw);
+});
+clipVideo.addEventListener("error", () => {
+  if (!state.videoURL) return;
+  showClipError("The video could not be loaded from this source. For links, check the URL is a direct video file and the host allows playback. For uploads, try a different file (H.264 MP4 is the safest).");
+});
+
+function showClipError(html) {
+  $("clipError").innerHTML = html;
+  show($("clipError"));
+}
+function showClipNote(text) { $("clipNote").textContent = text; show($("clipNote")); }
+
+$("manualToggle").addEventListener("change", (e) => {
+  $("manualBox").style.display = e.target.checked ? "flex" : "none";
+});
+
+/* ---------------- Batched SAM calls ---------------- */
+async function samBatch(frames, signal, endpoint) {
+  const payload = frames.map((f) => ({ index: f.index, time: f.time, image: f.image }));
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ frames: payload }),
+    signal,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Server returned HTTP ${res.status} on ${endpoint}.`);
+  }
+  return data;
+}
+
+async function samOverFrames(frames, signal, endpoint, onBatch) {
+  const all = [];
+  let totalErrors = 0;
+  for (let i = 0; i < frames.length; i += BATCH) {
+    if (signal.aborted) throw new DOMException("Scan cancelled.", "AbortError");
+    const batch = frames.slice(i, i + BATCH);
+    const out = await samBatch(batch, signal, endpoint);
+    totalErrors += out.sam_errors || 0;
+    all.push(...(out.results || []));
+    if (onBatch) onBatch(Math.min(i + BATCH, frames.length), frames.length);
+    if (out.model_ok === false) {
+      const err = new Error(out.error || "The model service failed. This is a connection problem, not a 'no board found' result.");
+      err.isModelError = true;
+      err.partial = all;
+      throw err;
+    }
+  }
+  return { results: all, sam_errors: totalErrors };
+}
+
+function makeThumb(dataUrl, maxW) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxW / img.width);
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(img.width * scale));
+      c.height = Math.max(1, Math.round(img.height * scale));
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      resolve(c.toDataURL("image/jpeg", 0.65));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+async function extractFramesInRange(video, start, end, fps, maxFrames, signal, onProgress) {
+  const duration = video.duration;
+  const s = Math.max(0, start), e = Math.min(duration, Math.max(s + 0.2, end));
+  const count = Math.max(2, Math.min(maxFrames, Math.floor((e - s) * fps) + 1));
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 360;
+  const scale = Math.min(1, 480 / vw);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(2, Math.round(vw * scale));
+  canvas.height = Math.max(2, Math.round(vh * scale));
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const frames = [];
+  for (let i = 0; i < count; i++) {
+    if (signal.aborted) throw new DOMException("Scan cancelled.", "AbortError");
+    const t = s + (i / Math.max(1, count - 1)) * (e - s);
+    await seekTo(video, t);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    let dataUrl;
+    try { dataUrl = canvas.toDataURL("image/jpeg", 0.72); }
+    catch (err) { throw new Error("CORS blocked: this video host does not allow frame reads. Download the clip and upload the file instead."); }
+    frames.push({ index: i, time: t, image: dataUrl, width: canvas.width, height: canvas.height });
+    if (onProgress) onProgress(i + 1, count);
+  }
+  return frames;
+}
+
+/* ---------------- Auto scan ---------------- */
+function setClipProgress(stage, done, total, startedAt, extra) {
+  show($("clipProgress"));
+  $("clipStage").textContent = stage;
+  const elapsed = startedAt ? ((Date.now() - startedAt) / 1000).toFixed(0) + "s elapsed" : "";
+  $("clipMeta").textContent = [total ? `SAM frame ${done} of ${total}` : "", elapsed, extra || ""].filter(Boolean).join(" · ");
+  $("clipBar").style.width = total ? Math.round((done / total) * 100) + "%" : "0%";
+}
+function hideClipProgress() { hide($("clipProgress")); $("clipBar").style.width = "0%"; }
+
+$("cancelBtn").addEventListener("click", () => {
+  if (state.scanAbort) state.scanAbort.abort();
+});
+
+async function runAutoScan() {
+  if (!state.health.ok) {
+    await checkHealth();
+    if (!state.health.ok) return showClipError("<b>Models unreachable.</b> Scanning is paused until the Meta models answer. " + esc(state.health.error));
+  }
+  if (!state.videoURL) return showClipError("Add a clip first — upload a file or paste a direct video-file link.");
+  hide($("clipError")); hide($("clipNote"));
+  const fps = Math.max(4, Math.min(12, Number($("fpsInput").value) || 8));
+  const manual = $("manualToggle").checked;
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  state.scanAbort = controller;
+  const signal = controller.signal;
+  $("cancelBtn").style.display = "inline-block";
+  $("autoBtn").disabled = true;
+
+  const run = {
+    id: "run-" + Date.now().toString(36) + "-" + Math.floor(Math.random() * 1e6).toString(36),
+    title: state.videoName || "Clip analysis",
+    source: state.videoKind === "link" ? "link" : "upload",
+    sourceRef: state.videoKind === "link" ? state.videoName : "",
+    createdAt: Date.now(), updatedAt: Date.now(),
+    status: "processing", error: "", stats: null, verification: null, frames: [], window: null, notes: [],
+  };
+  state.currentRunId = run.id;
+  upsertRun(run);
+
+  try {
+    let windowInfo, windowFrames;
+    if (manual) {
+      const start = Math.max(0, Number($("manualStart").value) || 0);
+      const end = Math.max(start + 0.2, Number($("manualEnd").value) || 0);
+      windowInfo = { window: { start, end, takeoffTime: start, landingTime: end }, reason: "Manual window override — takeoff/landing are the window edges you set." };
+      setClipProgress("Extracting frames in your window…", 0, 0, startedAt);
+      windowFrames = await extractFramesInRange(clipVideo, start, end, fps, 30, signal, (d, t) => setClipProgress("Extracting frames in your window…", d, t, startedAt));
+    } else {
+      setClipProgress("Extracting frames across the whole clip…", 0, 0, startedAt);
+      const coarse = await extractFrames(clipVideo, { fps: Math.min(fps, 6), maxFrames: 30, signal, onProgress: (d, t) => setClipProgress("Extracting frames across the whole clip…", d, t, startedAt) });
+      setClipProgress("SAM 3.1 is hunting for the board…", 0, coarse.length, startedAt);
+      const scanned = await samOverFrames(coarse, signal, "/api/detect", (d, t) => setClipProgress("SAM 3.1 is hunting for the board…", d, t, startedAt));
+      if (scanned.sam_errors > 0) run.notes.push(`SAM model errors on ${scanned.sam_errors} coarse-scan frame(s) — counted separately from no-board frames.`);
+      const foundCount = scanned.results.filter((r) => r.found).length;
+      const detected = detectWindowFromCy(scanned.results);
+      if (!detected.window) {
+        throw new Error(detected.reason + ` (Board locked in ${foundCount} of ${scanned.results.length} sampled frames.)`);
+      }
+      windowInfo = detected;
+      run.notes.push(detected.reason);
+      setClipProgress("Extracting frames in the trick window…", 0, 0, startedAt);
+      windowFrames = await extractFramesInRange(clipVideo, detected.window.start, detected.window.end, fps, 30, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt));
+    }
+    run.window = windowInfo.window;
+
+    setClipProgress("SAM 3.1 is tracking the board…", 0, windowFrames.length, startedAt);
+    const analyzed = await samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is tracking the board…", d, t, startedAt));
+    if (analyzed.sam_errors > 0) run.notes.push(`SAM model errors on ${analyzed.sam_errors} window frame(s) — counted separately from no-board frames.`);
+    const byIndex = new Map(analyzed.results.map((r) => [r.index, r]));
+
+    // Board-axis angle per found frame (pixel moments inside the SAM box).
+    const samples = [];
+    for (const f of windowFrames) {
+      if (signal.aborted) throw new DOMException("Scan cancelled.", "AbortError");
+      const sam = byIndex.get(f.index);
+      let angle = null;
+      if (sam && sam.found && sam.box) {
+        const est = await estimateBoardAngle(f.image, sam.box);
+        if (est) angle = est.angleDeg;
+      }
+      samples.push({ index: f.index, time: f.time, found: !!(sam && sam.found), box: sam ? sam.box : null, cy: sam ? sam.cy : null, angleDeg: angle, image: f.image });
+    }
+    const curve = unwrapAngles(samples);
+    const stats = computeStats(curve, windowInfo.window.takeoffTime, windowInfo.window.landingTime);
+    if (!stats) throw new Error("Too few measured frames to build a rotation curve — SAM locked the board but angles could not be estimated. Try a closer/clearer clip.");
+    run.stats = stats;
+
+    // Thumbnails for the strip (storage-friendly) + measured curve.
+    const storedFrames = [];
+    for (const p of curve) {
+      storedFrames.push({ index: p.index, time: p.time, found: p.found, angle_deg: p.angleDeg, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
+    }
+    run.frames = storedFrames;
+    run.window = windowInfo.window;
+
+    // Spark verification from 3 keyframes.
+    const foundSamples = curve.filter((p) => p.found);
+    const keys = foundSamples.length >= 3
+      ? [foundSamples[0], foundSamples[Math.floor(foundSamples.length / 2)], foundSamples[foundSamples.length - 1]]
+      : foundSamples;
+    setClipProgress("Muse Spark is verifying the trick…", 0, 0, startedAt);
+    try {
+      const vres = await fetch("/api/verify", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          images: keys.map((k) => k.image),
+          measured: { total_degrees: Math.round(stats.total_degrees), airtime_s: Number(stats.airtime_s.toFixed(2)), direction: stats.direction },
+        }),
+        signal,
+      });
+      const vdata = await vres.json().catch(() => ({}));
+      if (vdata.verification) {
+        run.verification = { ...vdata.verification, agreement: vdata.agreement || "UNVERIFIED" };
+      } else {
+        run.verification = null;
+        run.notes.push("Spark verification did not return a call: " + (vdata.error || "unknown verification error") + ". Measured stats above are still real; the trick call is honestly unverified.");
+      }
+    } catch (verr) {
+      run.verification = null;
+      run.notes.push("Spark verification failed: " + (verr.message || String(verr)) + ". Measured stats above are still real; the trick call is honestly unverified.");
+    }
+
+    run.status = "complete";
+    run.error = "";
+    upsertRun(run);
+    renderResult(run);
+    $("results").hidden = false;
+    $("results").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      run.status = "failed";
+      run.error = "Cancelled by you. Nothing was saved as a result.";
+      upsertRun(run);
+      showClipNote("Scan cancelled. No result was saved. You can run it again any time.");
+    } else {
+      run.status = "failed";
+      run.error = err && err.message ? err.message : String(err);
+      upsertRun(run);
+      const label = err && err.isModelError ? "<b>Model service problem — not a “no board found” result.</b><br>" : "<b>Scan failed.</b><br>";
+      showClipError(label + esc(run.error));
+    }
+  } finally {
+    hideClipProgress();
+    $("cancelBtn").style.display = "none";
+    $("autoBtn").disabled = false;
+    state.scanAbort = null;
+    applyHealthGate();
+    if ($("tab-runs").hidden === false) renderRuns();
+  }
+}
+$("autoBtn").addEventListener("click", runAutoScan);
+
+/* ---------------- Rendering: dial / chart / strip / verdict ---------------- */
+function drawDial(svg, degrees) {
+  const deg = ((degrees % 360) + 360) % 360;
+  const rad = (deg - 90) * Math.PI / 180;
+  const x2 = 110 + 82 * Math.cos(rad), y2 = 110 + 82 * Math.sin(rad);
+  let ticks = "";
+  for (const t of [0, 90, 180, 270]) {
+    const a = (t - 90) * Math.PI / 180;
+    const x1 = 110 + 92 * Math.cos(a), y1 = 110 + 92 * Math.sin(a);
+    const x2t = 110 + 104 * Math.cos(a), y2t = 110 + 104 * Math.sin(a);
+    ticks += `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2t.toFixed(1)}" y2="${y2t.toFixed(1)}" stroke="#8a8a94" stroke-width="2"/>`;
+    const lx = 110 + 78 * Math.cos(a), ly = 110 + 78 * Math.sin(a);
+    ticks += `<text x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" fill="#8a8a94" font-size="11" text-anchor="middle">${t}°</text>`;
+  }
+  svg.innerHTML =
+    `<circle cx="110" cy="110" r="104" fill="#0d0d0f" stroke="#e10600" stroke-width="3"/>` +
+    `<circle cx="110" cy="110" r="88" fill="none" stroke="#2c2c32" stroke-width="1"/>` + ticks +
+    `<line x1="110" y1="110" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="#ff2a1f" stroke-width="5" stroke-linecap="round"/>` +
+    `<circle cx="110" cy="110" r="9" fill="#f5f5f7"/>`;
+}
+function drawChart(canvas, curve, windowInfo) {
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#0d0d0f"; ctx.fillRect(0, 0, W, H);
+  const pts = curve.filter((p) => p.cum_deg != null);
+  ctx.strokeStyle = "#2c2c32"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(44, 8); ctx.lineTo(44, H - 26); ctx.lineTo(W - 8, H - 26); ctx.stroke();
+  ctx.fillStyle = "#8a8a94"; ctx.font = "11px sans-serif";
+  ctx.fillText("rotation", 6, 16); ctx.fillText("time →", W - 52, H - 8);
+  if (pts.length < 2) {
+    ctx.fillStyle = "#8a8a94"; ctx.font = "14px sans-serif";
+    ctx.fillText("Not enough measured points to draw a curve.", 56, H / 2);
+    return;
+  }
+  const t0 = pts[0].time, t1 = pts[pts.length - 1].time || t0 + 1;
+  const vals = pts.map((p) => p.cum_deg);
+  const vMin = Math.min(...vals), vMax = Math.max(...vals);
+  const span = Math.max(10, vMax - vMin);
+  const X = (t) => 44 + ((t - t0) / Math.max(0.001, t1 - t0)) * (W - 56);
+  const Y = (v) => (H - 26) - ((v - vMin) / span) * (H - 44);
+  ctx.strokeStyle = "#e10600"; ctx.lineWidth = 3; ctx.beginPath();
+  let penDown = false;
+  for (const p of curve) {
+    if (p.cum_deg == null) { penDown = false; continue; }
+    if (!penDown) { ctx.moveTo(X(p.time), Y(p.cum_deg)); penDown = true; }
+    else ctx.lineTo(X(p.time), Y(p.cum_deg));
+  }
+  ctx.stroke();
+  ctx.fillStyle = "#f5f5f7";
+  for (const p of pts) { ctx.beginPath(); ctx.arc(X(p.time), Y(p.cum_deg), 3, 0, Math.PI * 2); ctx.fill(); }
+  ctx.fillStyle = "#8a8a94"; ctx.font = "11px sans-serif";
+  ctx.fillText(Math.round(vMax) + "°", 6, Y(vMax) + 4);
+  ctx.fillText(Math.round(vMin) + "°", 6, Y(vMin) + 4);
+}
+
+let selectedFrame = 0;
+function renderResult(run) {
+  $("results").hidden = false;
+  $("resultTitle").textContent = `${run.title || "Run"} · ${new Date(run.createdAt).toLocaleString()} · ${run.source || ""}${run.window ? ` · window ${run.window.start.toFixed(2)}s–${run.window.end.toFixed(2)}s` : ""} · status: ${run.status}`;
+  const s = run.stats;
+  $("statTotal").innerHTML = s ? `${Math.round(s.total_degrees)}<small>°</small>` : "—";
+  $("statAir").innerHTML = s ? `${s.airtime_s.toFixed(2)}<small>s</small>` : "—";
+  $("statPeak").innerHTML = s ? `${Math.round(s.peak_rate)}<small>°/s</small>` : "—";
+  $("statAvg").innerHTML = s ? `${Math.round(s.avg_rate)}<small>°/s</small>` : "—";
+  const frames = run.frames || [];
+  const foundN = frames.filter((f) => f.found).length;
+  $("statFound").innerHTML = frames.length ? `${foundN}<small>/${frames.length}</small>` : "—";
+  const call = run.verification ? run.verification.agreement : "UNVERIFIED";
+  const callEl = $("verdictCall");
+  callEl.textContent = call;
+  callEl.className = "call " + call;
+  if (run.verification) {
+    const v = run.verification;
+    $("verdictDetail").innerHTML =
+      `<b>${esc(v.trick || "Unknown")}</b> · ${esc(v.direction || "unknown")} · Spark total <b>${fmtDeg(v.total_degrees)}</b> ` +
+      `vs measured <b>${s ? fmtDeg(s.total_degrees) : "—"}</b> · confidence ${Math.round((v.confidence || 0) * 100)}%<br>${esc(v.reason || "")}`;
+  } else {
+    $("verdictDetail").textContent = run.status === "failed"
+      ? ("No verification — run failed: " + (run.error || "unknown error"))
+      : "No verification call returned. Measured stats are shown as measured; the trick call stays unverified rather than guessed.";
+  }
+  const curve = frames.map((f) => ({ time: f.time, cum_deg: f.cum_deg }));
+  drawChart($("chart"), curve, run.window);
+  selectedFrame = 0;
+  const firstCum = (frames.find((f) => f.cum_deg != null) || {}).cum_deg || 0;
+  drawDial($("dial"), firstCum);
+  $("dialDeg").textContent = fmtDeg(firstCum);
+  const strip = $("frameStrip");
+  strip.innerHTML = "";
+  frames.forEach((f, i) => {
+    const card = document.createElement("div");
+    card.className = "frame-card" + (i === 0 ? " sel" : "");
+    card.innerHTML = `<img src="${esc(f.thumb || "")}" alt="Frame ${i + 1} at ${f.time.toFixed(2)} seconds">` +
+      `<div class="fmeta">${f.time.toFixed(2)}s<br><span class="${f.found ? "found" : "miss"}">${f.found ? "board ✓" : "no lock"}</span><br>${f.cum_deg != null ? fmtDeg(f.cum_deg) : "—"}</div>`;
+    card.addEventListener("click", () => {
+      selectedFrame = i;
+      strip.querySelectorAll(".frame-card").forEach((c) => c.classList.remove("sel"));
+      card.classList.add("sel");
+      const cum = f.cum_deg;
+      drawDial($("dial"), cum != null ? cum : 0);
+      $("dialDeg").textContent = fmtDeg(cum);
+    });
+    strip.appendChild(card);
+  });
+  $("cancelRunBtn").style.display = run.status === "processing" ? "inline-block" : "none";
+  const notes = [...(run.notes || [])];
+  if (run.error && run.status === "failed") notes.push("Error: " + run.error);
+  if (notes.length) { $("resultNote").textContent = notes.join(" "); show($("resultNote")); }
+  else hide($("resultNote"));
+}
+
+$("replayBtn").addEventListener("click", () => {
+  const run = getRun(state.currentRunId);
+  if (!run || !run.frames || !run.frames.length) return;
+  if (state.replayTimer) clearInterval(state.replayTimer);
+  let i = 0;
+  const cards = [...$("frameStrip").querySelectorAll(".frame-card")];
+  state.replayTimer = setInterval(() => {
+    if (i >= run.frames.length) { clearInterval(state.replayTimer); state.replayTimer = null; return; }
+    const f = run.frames[i];
+    cards.forEach((c, k) => c.classList.toggle("sel", k === i));
+    drawDial($("dial"), f.cum_deg != null ? f.cum_deg : 0);
+    $("dialDeg").textContent = fmtDeg(f.cum_deg);
+    i++;
+  }, 125);
+});
+$("cancelRunBtn").addEventListener("click", () => {
+  const run = getRun(state.currentRunId);
+  if (!run) return;
+  run.status = "failed"; run.error = "Cancelled. Safe to re-run.";
+  upsertRun(run); renderResult(run);
+});
+$("deleteRunBtn").addEventListener("click", () => {
+  if (!state.currentRunId) return;
+  if (!confirm("Delete this run?")) return;
+  deleteRun(state.currentRunId);
+  $("results").hidden = true;
+  state.currentRunId = null;
+  renderRuns();
+});
+$("rerunBtn").addEventListener("click", () => {
+  const run = getRun(state.currentRunId);
+  if (run && run.source === "link" && run.sourceRef) {
+    $("linkInput").value = run.sourceRef;
+    setSource(run.sourceRef, "link", run.sourceRef);
+    document.querySelector('[data-tab="clip"]').click();
+    showClipNote("Link reloaded. Tap “Find the trick & analyze” to re-run cleanly.");
+  } else if (run && run.source === "live") {
+    document.querySelector('[data-tab="live"]').click();
+    showClipNote("Live runs cannot be replayed — start a new live tracking session.");
+  } else {
+    document.querySelector('[data-tab="clip"]').click();
+    showClipNote("Re-upload the clip file, then tap “Find the trick & analyze” to re-run cleanly. Uploaded files are not kept after a reload, by design.");
+  }
+});
+
+/* ---------------- Live mode ---------------- */
+const live = {
+  stream: null, tracking: false, timer: null,
+  samples: [], startedAt: 0, snowLine: null,
+  takeoffTime: null, landingTime: null, takeoffIdx: -1,
+  consecutiveErrors: 0, lastLatencyMs: null, abort: null,
+  warned: false,
+};
+const liveVideo = $("liveVideo");
+
+function liveStatus() {
+  const found = live.samples.filter((s) => s.found).length;
+  const el = $("liveStats");
+  if (!live.samples.length && !live.tracking) { hide(el); return; }
+  el.textContent = `Samples: ${live.samples.length} · board locked: ${found} · ` +
+    `last SAM: ${live.lastLatencyMs != null ? live.lastLatencyMs + "ms" : "—"} · ` +
+    `takeoff: ${live.takeoffTime != null ? live.takeoffTime.toFixed(2) + "s" : "—"} · ` +
+    `landing: ${live.landingTime != null ? live.landingTime.toFixed(2) + "s" : "—"} · ` +
+    `consecutive model errors: ${live.consecutiveErrors}`;
+  show(el);
+}
+
+$("camBtn").addEventListener("click", async () => {
+  hide($("liveError"));
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("This browser does not expose a camera (getUserMedia unavailable). Use clip upload instead.");
+    }
+    live.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    liveVideo.srcObject = live.stream;
+    await liveVideo.play().catch(() => {});
+    applyHealthGate();
+  } catch (err) {
+    const name = err && err.name;
+    const msg = name === "NotAllowedError"
+      ? "Camera permission was denied. Allow camera access in the browser prompt (or browser site settings) and tap Start camera again."
+      : name === "NotFoundError" || name === "OverconstrainedError"
+        ? "No camera was found on this device. Use clip upload instead."
+        : "Could not start the camera: " + (err.message || String(err));
+    $("liveError").textContent = msg;
+    show($("liveError"));
+  }
+});
+
+function liveSnowLine() {
+  const cys = live.samples.filter((s) => s.found && Number.isFinite(s.cy)).map((s) => s.cy).sort((a, b) => a - b);
+  if (cys.length < 5) return null;
+  return cys[Math.floor(cys.length * 0.9)];
+}
+
+async function captureLiveFrame() {
+  const vw = liveVideo.videoWidth || 640, vh = liveVideo.videoHeight || 360;
+  const scale = Math.min(1, 480 / vw);
+  const c = document.createElement("canvas");
+  c.width = Math.max(2, Math.round(vw * scale));
+  c.height = Math.max(2, Math.round(vh * scale));
+  c.getContext("2d").drawImage(liveVideo, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.72);
+}
+
+async function liveTick() {
+  if (!live.tracking) return;
+  const t = (Date.now() - live.startedAt) / 1000;
+  let image;
+  try { image = await captureLiveFrame(); }
+  catch (err) { return; }
+  const t0 = Date.now();
+  try {
+    const res = await fetch("/api/live-frame", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image }),
+      signal: live.abort ? live.abort.signal : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    live.lastLatencyMs = Date.now() - t0;
+    if (data.model_error) throw new Error(data.error || "Model service error on live frame.");
+    live.consecutiveErrors = 0;
+    let angle = null;
+    if (data.found && data.box) {
+      const est = await estimateBoardAngle(image, data.box);
+      if (est) angle = est.angleDeg;
+    }
+    live.samples.push({ time: t, found: !!data.found, box: data.box || null, cy: data.cy, angleDeg: angle, image });
+    // Auto takeoff / landing.
+    if ($("autoLandToggle").checked) {
+      const line = liveSnowLine();
+      if (line != null) live.snowLine = line;
+      if (live.snowLine != null && data.found && Number.isFinite(data.cy)) {
+        const above = data.cy < live.snowLine - 0.08;
+        const recent = live.samples.slice(-2);
+        if (live.takeoffTime == null && above && recent.length === 2 && recent.every((s) => s.found && Number.isFinite(s.cy) && s.cy < live.snowLine - 0.08)) {
+          live.takeoffTime = live.samples[live.samples.length - 2].time;
+          live.takeoffIdx = live.samples.length - 2;
+        } else if (live.takeoffTime != null && live.landingTime == null && !above && recent.length === 2 && recent.every((s) => s.found && Number.isFinite(s.cy) && s.cy >= live.snowLine - 0.05)) {
+          live.landingTime = t;
+          finishLiveSession("auto");
+          return;
+        }
+      }
+    }
+    updateLiveView();
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+    live.consecutiveErrors += 1;
+    live.lastLatencyMs = Date.now() - t0;
+    live.samples.push({ time: t, found: false, box: null, cy: null, angleDeg: null, image, model_error: true });
+    if (live.consecutiveErrors >= 3 && !live.warned) {
+      live.warned = true;
+      $("liveWarn").textContent = "Warning: the model service has failed 3 times in a row (" + (err.message || String(err)) + "). Live tracking keeps retrying, but no result will be shown until the models answer. Check the MODELS badge at the top.";
+      show($("liveWarn"));
+    }
+    updateLiveView();
+  }
+  liveStatus();
+}
+
+function updateLiveView() {
+  const curve = unwrapAngles(live.samples.map((s) => ({ time: s.time, angleDeg: s.angleDeg })));
+  const last = [...curve].reverse().find((p) => p.cum_deg != null);
+  drawDial($("liveDial"), last ? last.cum_deg : 0);
+  $("liveDeg").textContent = fmtDeg(last ? last.cum_deg : 0);
+  drawChart($("liveChart"), curve, null);
+}
+
+$("trackBtn").addEventListener("click", () => {
+  if (!state.health.ok) { $("liveError").textContent = "Models unreachable — live tracking is paused until the Meta models answer. See the badge at the top."; show($("liveError")); return; }
+  if (!live.stream) { $("liveError").textContent = "Start the camera first."; show($("liveError")); return; }
+  hide($("liveError")); hide($("liveWarn"));
+  live.tracking = true; live.samples = []; live.startedAt = Date.now();
+  live.takeoffTime = null; live.landingTime = null; live.takeoffIdx = -1;
+  live.consecutiveErrors = 0; live.warned = false; live.snowLine = null;
+  live.abort = new AbortController();
+  $("liveDot").classList.add("show");
+  $("trackBtn").disabled = true; $("stopTrackBtn").disabled = false;
+  $("markTakeoffBtn").disabled = false; $("markLandingBtn").disabled = false;
+  live.timer = setInterval(() => { liveTick().catch(() => {}); }, 1000);
+  liveTick().catch(() => {});
+  liveStatus();
+});
+
+function stopLiveTimer() {
+  if (live.timer) clearInterval(live.timer);
+  live.timer = null;
+  live.tracking = false;
+  $("liveDot").classList.remove("show");
+  $("trackBtn").disabled = false; $("stopTrackBtn").disabled = true;
+  $("markTakeoffBtn").disabled = true; $("markLandingBtn").disabled = true;
+}
+
+$("stopTrackBtn").addEventListener("click", () => {
+  const hadTakeoff = live.takeoffTime != null;
+  stopLiveTimer();
+  if (live.abort) live.abort.abort();
+  if (hadTakeoff) {
+    saveLiveRun(null, "Tracking stopped before landing was detected. No result saved as complete.");
+  }
+  liveStatus();
+});
+$("markTakeoffBtn").addEventListener("click", () => {
+  live.takeoffTime = (Date.now() - live.startedAt) / 1000;
+  live.takeoffIdx = Math.max(0, live.samples.length - 1);
+  liveStatus();
+});
+$("markLandingBtn").addEventListener("click", () => {
+  live.landingTime = (Date.now() - live.startedAt) / 1000;
+  finishLiveSession("manual");
+});
+
+async function finishLiveSession(how) {
+  stopLiveTimer();
+  if (live.abort) live.abort.abort();
+  const takeoff = live.takeoffTime != null ? live.takeoffTime : (live.samples[0] ? live.samples[0].time : 0);
+  const landing = live.landingTime != null ? live.landingTime : (live.samples.length ? live.samples[live.samples.length - 1].time : takeoff);
+  const windowSamples = live.samples.filter((s) => s.time >= takeoff - 0.01 && s.time <= landing + 0.01);
+  const curve = unwrapAngles(windowSamples.map((s) => ({ time: s.time, angleDeg: s.angleDeg })));
+  const merged = windowSamples.map((s, i) => ({ ...s, cum_deg: curve[i] ? curve[i].cum_deg : null }));
+  const stats = computeStats(merged, takeoff, landing);
+  if (!stats) {
+    saveLiveRun(null, "Live session ended without enough measured frames to build a rotation curve.");
+    return;
+  }
+  const foundSamples = merged.filter((p) => p.found);
+  const keys = foundSamples.length >= 3
+    ? [foundSamples[0], foundSamples[Math.floor(foundSamples.length / 2)], foundSamples[foundSamples.length - 1]]
+    : foundSamples;
+  let verification = null, verifyNote = "";
+  try {
+    const vres = await fetch("/api/verify", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ images: keys.map((k) => k.image), measured: { total_degrees: Math.round(stats.total_degrees), airtime_s: Number(stats.airtime_s.toFixed(2)), direction: stats.direction } }),
+    });
+    const vdata = await vres.json().catch(() => ({}));
+    if (vdata.verification) verification = { ...vdata.verification, agreement: vdata.agreement || "UNVERIFIED" };
+    else verifyNote = "Spark verification did not return a call: " + (vdata.error || "unknown error") + ".";
+  } catch (err) {
+    verifyNote = "Spark verification failed: " + (err.message || String(err)) + ".";
+  }
+  const storedFrames = [];
+  for (const p of merged) {
+    storedFrames.push({ index: storedFrames.length, time: p.time, found: p.found, angle_deg: p.angleDeg, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
+  }
+  const run = {
+    id: "run-live-" + Date.now().toString(36),
+    title: "Live session (" + how + " takeoff/landing)",
+    source: "live", sourceRef: "",
+    createdAt: Date.now(), updatedAt: Date.now(),
+    status: "complete", error: "",
+    stats, verification,
+    frames: storedFrames,
+    window: { start: takeoff, end: landing, takeoffTime: takeoff, landingTime: landing },
+    notes: [verifyNote, `Takeoff/landing via ${how} detection.`].filter(Boolean),
+  };
+  upsertRun(run);
+  state.currentRunId = run.id;
+  renderResult(run);
+  document.querySelector('[data-tab="clip"]').click();
+  $("results").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function saveLiveRun(_ignored, errorText) {
+  const run = {
+    id: "run-live-" + Date.now().toString(36),
+    title: "Live session (incomplete)",
+    source: "live", sourceRef: "",
+    createdAt: Date.now(), updatedAt: Date.now(),
+    status: "failed", error: errorText || "Incomplete live session.",
+    stats: null, verification: null, frames: [], window: null, notes: [],
+  };
+  upsertRun(run);
+  $("liveWarn").textContent = errorText || "";
+  show($("liveWarn"));
+}
+
+/* ---------------- Init ---------------- */
+sweepStuckRuns();
+renderRuns();
+drawDial($("dial"), 0);
+drawDial($("liveDial"), 0);
+startHealthLoop();
+</script>
+</body>
+</html>

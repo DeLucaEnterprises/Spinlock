@@ -1,0 +1,4 @@
+# Local-dev secrets ONLY. Copy to `.dev.vars` (gitignored) and paste your real key there.
+# NEVER commit `.dev.vars`, and NEVER put a real key in this example file.
+# For deployed runs, use:  npx wrangler secret put META_API_KEY
+META_API_KEY="YOUR_META_API_KEY_HERE"
