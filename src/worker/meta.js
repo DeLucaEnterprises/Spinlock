@@ -278,19 +278,27 @@ export async function classifyAirtime({ apiKey, base, frames, timeoutMs = 60000 
  * Yaw convention: 0 = chest facing the camera, 90 = chest facing the right
  * side of the frame, 180 = back to the camera, 270 = chest facing the left
  * side of the frame. Yaw increases in the clockwise direction as seen.
- * Returns { frames: [{index,time,yaw_deg,facing,confidence}], total_degrees,
- * direction, confidence }. Throws MetaError on incomplete replies.
+ * Each frame is judged in TWO steps — coarse facing bucket first, then a
+ * yaw angle consistent with that bucket — because unconstrained yaw
+ * numbers compress in ambiguous three-quarter views (Nov 18: a real 360
+ * read as 229° on crops, with the later steps systematically under-read).
+ * A frame whose yaw contradicts its own bucket by more than 90° is
+ * marked confidence 0, so the curve fit drops it instead of trusting it.
+ * Returns { frames: [{index,time,yaw_deg,facing,facing_bucket,confidence}],
+ * total_degrees, direction, confidence }. Throws MetaError on incomplete
+ * replies.
  */
-export async function estimateYawSequence({ apiKey, base, frames, timeoutMs = 60000 }) {
+export async function estimateYawSequence({ apiKey, base, frames, timeoutMs = 90000 }) {
   const frameList = frames.map((f, i) => `Frame ${i + 1} (t=${f.time.toFixed(2)}s)`).join(", ");
   const prompt = [
-    "You are estimating a snowboarder's spin from frames in time order covering ONE airborne trick.",
+    "You are estimating a snowboarder's spin from cropped, enlarged frames in time order covering ONE airborne trick. The crops show the SAME rider throughout.",
     `Frames: ${frameList}.`,
-    "For EACH frame, estimate the rider's chest-facing yaw angle in degrees: 0 = chest facing the camera, 90 = chest facing the right side of the frame, 180 = back to the camera, 270 = chest facing the left side of the frame. Yaw increases clockwise as seen by the camera. Always answer 0-359. Judge from the rider's chest, shoulders, and board orientation.",
-    "Also give facing (front/back/left-profile/right-profile/three-quarter) and confidence 0-1 per frame. If you cannot judge a frame, use confidence 0 and your best yaw estimate — never omit a frame.",
+    "Judge EACH frame in two steps. Step 1: the facing bucket — toward_camera (chest/face toward the camera, goggles or face visible), facing_right (chest facing the right side of the frame), away_from_camera (back to the camera, back of jacket/helmet, no face), facing_left (chest facing the left side of the frame), or unknown. Judge from the helmet/goggles, chest vs back of the jacket, shoulder line, and board angle. If a frame is ambiguous, say unknown.",
+    "Step 2: the yaw angle in degrees, CONSISTENT with the bucket you chose: toward_camera means 315-45, facing_right means 45-135, away_from_camera means 135-225, facing_left means 225-315. (0 = chest facing the camera, 90 = chest facing frame-right, 180 = back to camera, 270 = chest facing frame-left; yaw increases clockwise as seen by the camera.) Always answer 0-359. If the bucket is unknown, give your best yaw estimate and confidence 0. Never omit a frame.",
+    "Also give facing (front/back/left-profile/right-profile/three-quarter) and confidence 0-1 per frame.",
     "Then estimate the overall spin: total_degrees (how far the rider rotated from the first frame to the last), direction as seen by the camera (clockwise/counter-clockwise), and overall confidence.",
     "Reply with JSON ONLY, no other text, one entry per frame in the same order:",
-    '{"frames":[{"index":1,"yaw_deg":10,"facing":"front","confidence":0.8}],"total_degrees":360,"direction":"clockwise","confidence":0.8}',
+    '{"frames":[{"index":1,"facing_bucket":"away_from_camera","yaw_deg":180,"facing":"back","confidence":0.8}],"total_degrees":360,"direction":"clockwise","confidence":0.8}',
     "Do not guess a trick name. Report what the frames show.",
   ].join("\n");
   const parsed = await sparkJson({
@@ -307,12 +315,17 @@ export async function estimateYawSequence({ apiKey, base, frames, timeoutMs = 60
   return {
     frames: list.map((entry, i) => {
       const yaw = Number(entry && entry.yaw_deg);
+      const bucket = typeof (entry && entry.facing_bucket) === "string" ? entry.facing_bucket : "unknown";
+      const consistent = yawMatchesBucket(yaw, bucket);
       return {
         index: frames[i].index,
         time: frames[i].time,
         yaw_deg: Number.isFinite(yaw) ? ((yaw % 360) + 360) % 360 : null,
         facing: typeof (entry && entry.facing) === "string" ? entry.facing : "",
-        confidence: clamp01(entry && entry.confidence),
+        facing_bucket: bucket,
+        // A yaw that contradicts its own bucket is an unreliable frame:
+        // zero its confidence so the fit drops it. Unknown buckets pass.
+        confidence: consistent ? clamp01(entry && entry.confidence) : 0,
       };
     }),
     total_degrees: Number.isFinite(total) ? total : 0,
@@ -329,6 +342,19 @@ const POSE_BUCKET_ANGLE = {
   away_from_camera: 180,
   facing_left: 270,
 };
+
+/**
+ * True when a yaw angle is consistent with its facing bucket: within 90°
+ * of the bucket center (the bucket's own 90° span, plus boundary slack).
+ * Unknown buckets and non-finite yaw pass — they carry no contradiction.
+ */
+export function yawMatchesBucket(yaw, bucket) {
+  const center = POSE_BUCKET_ANGLE[bucket];
+  if (center === undefined || !Number.isFinite(yaw)) return true;
+  let d = Math.abs((((yaw - center) % 360) + 360) % 360);
+  if (d > 180) d = 360 - d;
+  return d <= 90;
+}
 
 /**
  * Turn a coarse facing sequence into a rotation total (code, not model
@@ -399,7 +425,7 @@ export function bucketCycleTotal(entries) {
  * direction, total_degrees, confidence, reason }.
  * Throws MetaError when the reply does not cover every tile.
  */
-export async function poseFromSheet({ apiKey, base, sheet, times, timeoutMs = 60000 }) {
+export async function poseFromSheet({ apiKey, base, sheet, times, timeoutMs = 90000 }) {
   const tileList = times.map((t, i) => `Tile ${i + 1} (t=${t.toFixed(2)}s)`).join(", ");
   const prompt = [
     "You are judging ONE snowboard aerial trick from a contact sheet. The sheet shows the SAME rider cropped and enlarged in each frame, in time order, left to right, top to bottom. Each tile is labeled with its time.",

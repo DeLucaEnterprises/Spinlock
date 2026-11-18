@@ -987,11 +987,13 @@ function cropRiderImage(dataUrl, box) {
 
 /**
  * Compose rider crops into one labeled contact sheet (4 columns, tiles
- * 360px + time label bar), returned as a JPEG data URL. The pose call
- * judges the whole trick from this one image.
+ * 288px + time label bar), returned as a JPEG data URL. The pose call
+ * judges the whole trick from this one image. Tiles stay small on purpose:
+ * a 1440px-wide sheet timed out against the model API (Nov 18), while
+ * 288px tiles still show the rider ~4x larger than the full frame.
  */
 async function composeContactSheet(crops) {
-  const TILE = 360, LABEL = 40, COLS = 4;
+  const TILE = 288, LABEL = 36, COLS = 4;
   const rows = Math.max(1, Math.ceil(crops.length / COLS));
   const sheet = document.createElement("canvas");
   sheet.width = COLS * TILE;
@@ -1016,11 +1018,11 @@ async function composeContactSheet(crops) {
     ctx.fillStyle = "#141416";
     ctx.fillRect(x0, y0 + TILE, TILE, LABEL);
     ctx.fillStyle = "#ffffff";
-    ctx.font = "bold 22px system-ui, sans-serif";
+    ctx.font = "bold 19px system-ui, sans-serif";
     ctx.textBaseline = "middle";
-    ctx.fillText(`Tile ${i + 1} · ${crops[i].time.toFixed(2)}s`, x0 + 14, y0 + TILE + LABEL / 2);
+    ctx.fillText(`Tile ${i + 1} · ${crops[i].time.toFixed(2)}s`, x0 + 12, y0 + TILE + LABEL / 2);
   }
-  return sheet.toDataURL("image/jpeg", 0.82);
+  return sheet.toDataURL("image/jpeg", 0.75);
 }
 
 async function extractFramesInRange(video, start, end, fps, maxFrames, signal, onProgress, targetWidth) {
@@ -1182,6 +1184,7 @@ async function runAutoScan() {
         index: f.index, time: f.time,
         found: !!(sam && sam.found), box: sam ? sam.box : null, cy: sam ? sam.cy : null,
         yaw_deg: seq ? seq.yaw_deg : null, facing: seq ? seq.facing : "",
+        facing_bucket: seq ? seq.facing_bucket : "",
         confidence: seq ? seq.confidence : 0,
         image: f.image,
       };
@@ -1201,7 +1204,7 @@ async function runAutoScan() {
     // Thumbnails for the strip (storage-friendly) + fitted curve.
     const storedFrames = [];
     for (const p of fitted.curve) {
-      storedFrames.push({ index: p.index, time: p.time, found: p.found, angle_deg: p.yaw_deg, yaw_deg: p.yaw_deg, facing: p.facing, yaw_confidence: p.confidence, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
+      storedFrames.push({ index: p.index, time: p.time, found: p.found, angle_deg: p.yaw_deg, yaw_deg: p.yaw_deg, facing: p.facing, facing_bucket: p.facing_bucket, yaw_confidence: p.confidence, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
     }
     run.frames = storedFrames;
     run.window = windowInfo.window;
