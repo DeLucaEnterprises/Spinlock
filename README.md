@@ -11,9 +11,9 @@ Upload a clip, paste a direct video-file link, or point a live camera at the jum
 
 ## What it does
 
-1. **Find the trick automatically.** Paste a direct video link (MP4/WebM/MOV) or upload a clip and tap **Find the trick & analyze**. SPINLOCK samples frames across the whole video, segments the snowboard in each one, and finds the airborne stretch from board height against the learned snow line — takeoff, airtime, landing — with no scrubbing. A manual window override stays available.
-2. **Measure the rotation.** In the trick window, every frame is segmented again and the board-axis angle is measured from the SAM box plus pixel moments inside it. Angles unwrap into a rotation curve: total rotation, airtime, peak/average spin rate, a live dial synced to frame replay, a frame strip with per-frame degrees, and a rotation-over-time chart.
-3. **Verify independently.** Muse Spark 1.3 looks at takeoff / mid-air / landing frames and estimates the trick on its own. Measured vs. verified totals are shown side by side with a **LOCKED** (agree within 45°), **CLOSE** (within 120°), or **DISPUTED** call. If verification cannot run, the result honestly says **UNVERIFIED** — the trick is never guessed.
+1. **Find the trick automatically.** Paste a direct video link (MP4/WebM/MOV) or upload a clip and tap **Find the trick & analyze**. SPINLOCK samples frames across the whole video and judges board-to-snow contact frame by frame to find the airborne stretch — takeoff, airtime, landing — with no scrubbing. Contact judgement (not board height in the frame) is what works on follow-cam footage, where the camera tilts with the rider. A manual window override stays available, and a board-height fallback runs only if the vision check fails.
+2. **Measure the rotation.** In the trick window, SAM segments the board in every frame to confirm the lock, and Muse Spark estimates the rider's facing (yaw) in each airborne frame. The yaw estimates unwrap into a rotation curve and fit to a steady spin: total rotation, airtime, peak/average spin rate, a dial synced to frame replay, a frame strip with per-frame degrees, and a rotation-over-time chart.
+3. **Verify independently.** A separate Muse Spark call looks at takeoff / mid-air / landing frames and estimates the trick on its own, with no measured numbers fed in. Curve fit vs. verified totals are shown side by side with a **LOCKED** (agree within 45°, confident named trick), **CLOSE** (within 120°), or **DISPUTED** call. If verification cannot confirm a trick — including when both totals are 0° — the result honestly says **UNVERIFIED**. The trick is never guessed.
 4. **Live camera mode.** Start tracking before drop-in; SAM re-locks the board about once a second, the dial and curve build live, and auto takeoff/landing detection (on by default) calls both moments itself and verifies after touchdown. Manual Mark buttons stay as backup.
 5. **Run sheet.** Every run saves in the browser (local storage) with its measured frames, curve, and verification. Runs can be reopened, replayed, or deleted.
 
@@ -27,15 +27,17 @@ All Meta calls happen **server-side in the Worker** (`src/worker/`). The browser
 
 | Model | Used for | Call |
 |---|---|---|
-| `sam-3.1` | Segment the snowboard in each frame (box grammar + mask; geometry uses the box) | `POST /v1/responses`, image as base64 data URL, text prompt "snowboard" |
-| `muse-spark-1.3` | Verify trick name, direction, and total from 3 keyframes + measured summary (strict JSON reply) | `POST /v1/responses`, 3 images + measured summary |
+| `sam-3.1` | Segment the snowboard in each frame (box grammar + mask; geometry uses the box) to confirm the board lock | `POST /v1/responses`, image as base64 data URL, text prompt "snowboard" |
+| `muse-spark-1.3` | Judge airborne vs. on-snow per frame (airtime window); estimate rider facing (yaw) per airborne frame (rotation curve); independently verify trick name, direction, and total from 3 keyframes (strict JSON replies, no measured numbers fed to the verify call) | `POST /v1/responses`, images + task prompt |
 | `muse-wonder-1.0` | Listed in the health check only (available on the key); not used in this pipeline | `GET /v1/models` |
 
 Base URL: `https://api.meta.ai/v1`, Bearer auth with the `META_API_KEY` Worker secret. No file upload is needed for images — base64 data URLs work. The health gate (`GET /v1/models`) runs before any scan.
 
 ### Why SAM + Spark, in that order
 
-SAM gives a **measurable** first pass: a box per frame that geometry can be computed from. Spark gives an **independent** second opinion from the pictures themselves. When the two disagree, SPINLOCK says DISPUTED instead of picking the prettier number. A human (coach, judge, athlete) always makes the final call — SPINLOCK never calls a find on its own.
+SAM gives a **measurable** first pass: a box per frame confirming the board is actually locked. Spark gives the **judgement** a single camera requires: whether the board is off the snow, and which way the rider is facing as the spin progresses. The verify call is a **separate, unanchored** second opinion — it receives no measured numbers, so it cannot parrot the curve it is meant to check. When the two disagree, SPINLOCK says DISPUTED instead of picking the prettier number. A human (coach, judge, athlete) always makes the final call — SPINLOCK never calls a find on its own.
+
+> **Why not board-axis geometry?** An earlier version measured the board's image-plane axis angle and unwrapped it. On the first real clip (Nov 18) that produced 0° total on a real 360: a spin is rotation about the rider's vertical axis, and the board's image-plane axis only oscillates as the board foreshortens — it cannot see yaw. The same clip exposed the old snow-line window detection (9.12s "airtime" on a ~1.2s jump, because the follow-cam tilts with the rider) and a vacuous LOCKED (0° vs 0° at 0% confidence). All three were replaced with the vision-first pipeline above; the board-axis code survives only as the provisional live dial.
 
 ---
 
@@ -63,7 +65,9 @@ Browser ── frames (JPEG data URLs, ≤8/batch) ──► Worker ──► Me
 | `POST /api/detect` | Batched SAM segmentation for the coarse whole-clip scan (≤8 frames/call). |
 | `POST /api/analyze` | Batched SAM segmentation for trick-window frames (≤8 frames/call). |
 | `POST /api/live-frame` | Single-frame SAM segmentation for live camera mode. |
-| `POST /api/verify` | Spark verification from 3 keyframes + measured summary. Returns verification + LOCKED/CLOSE/DISPUTED/UNVERIFIED. |
+| `POST /api/airtime` | Spark per-frame airborne/ground classification for the coarse scan (≤16 frames/call). |
+| `POST /api/sequence` | Spark per-frame yaw estimation over one trick window (≤12 frames/call). |
+| `POST /api/verify` | Spark independent verification from 3 keyframes (no measured numbers in the prompt). Returns verification + LOCKED/CLOSE/DISPUTED/UNVERIFIED. |
 
 **Batching is a resiliency choice, not an accident.** Each Worker request stays short, the client shows real progress (`SAM frame X of N`), Cancel aborts between batches, and a failing model path fails fast instead of hanging a 30-frame scan. Runs persist in browser local storage in this standalone version — no database setup is needed for the judge test. (A venue deployment would add R2/Durable Objects for shared run history; see [What this version deliberately leaves out](#what-this-version-deliberately-leaves-out).)
 
@@ -148,13 +152,13 @@ Use the **official starter-pack footage** first — it is what the judging crite
 
 Report the two numbers that matter: **board-found rate on a real clip**, and **whether Spark's verified total matches the known trick**. Those decide whether the pipeline is submission-ready or needs tuning (frame rate, sample count, snow-line threshold).
 
-> **Honesty note (Nov 18, 2026):** the full SAM + Spark pipeline has not yet been proven end to end on real snowboard footage from the Muse development environment, because `api.meta.ai` is unreachable from there (egress proxy 403). The Worker code, batching, parsing, geometry, and all failure paths were verified locally; the SAM *success* path can only be proven once deployed to Cloudflare with a valid key — which is exactly the judge test above. Do not present any result as verified until that first deployed clip run succeeds.
+> **Proven so far (Nov 18, 2026):** the deployed Worker reaches Meta from Cloudflare (`/api/health` ok, all 10 models), and the first real clip (a 9.77s follow-cam 360) locked the board in 23 of 30 frames — the SAM success path works. That same run exposed three accuracy bugs (whole-clip window, 0° rotation, vacuous LOCKED), fixed the same day with the vision-first pipeline described above. The fixed pipeline's numbers (window, fitted total vs. the known trick) still await the first retest on the deployed Worker. Do not present any result as verified until that retest lands.
 
 ---
 
 ## Honest limits
 
-- **One camera = a 2D view.** Board-axis angle is measured from the visible box + pixels. A board seen edge-on, occluded by spray, or hidden behind the rider can be missed or misread. That is why board-found rate, per-frame gaps, and the independent Spark check are always visible — and why SPINLOCK reports DISPUTED instead of hiding disagreement.
+- **One camera = a 2D view.** Facing (yaw) is estimated from the visible rider. A rider hidden by spray, shot from directly behind the jump, or too small in frame produces low-confidence estimates — and the fit refuses to invent a total from fewer than 3 confident frames. That is why board-found rate, per-frame confidence, and the independent Spark check are always visible — and why SPINLOCK reports DISPUTED instead of hiding disagreement.
 - **Direct links need CORS.** A direct video-file link only works if its host allows cross-origin frame reads. Otherwise the browser blocks the canvas read and SPINLOCK reports a CORS error.
 - **Platform watch pages are refused.** YouTube, Vimeo, Instagram, TikTok, Facebook, and X links cannot be sampled frame-by-frame in any browser app. Download the clip (where you have the right to) and upload the file.
 - **Live mode is near-real-time, not zero-latency.** SAM re-locks about once a second; Spark verifies after touchdown (1–3s). That delay is the broadcast replay moment, not a defect.
@@ -182,7 +186,7 @@ Those are the documented next steps for a venue deployment — see the Cloudflar
 >
 > SPINLOCK is a snowboard rotation analysis tool for coaches and athletes, built as a Cloudflare Worker. Upload a slopestyle or halfpipe clip, paste a direct video link, or use the live camera — SPINLOCK finds the trick itself (takeoff, airtime, landing) instead of asking the user to scrub, measures the rotation curve frame by frame, and verifies the call independently.
 >
-> How it works: frames are extracted in the browser; Meta's SAM 3.1 segments the snowboard in each frame; board-axis geometry unwraps into a rotation curve with total rotation, airtime, and peak/average spin rate; Muse Spark 1.3 then verifies trick name, direction, and total from takeoff/mid-air/landing frames, and the two are shown side by side with a LOCKED / CLOSE / DISPUTED call. Results include a rotation dial synced to replay, a per-frame strip, a rotation-over-time chart, and a persistent run sheet. Live mode tracks from a camera feed with auto takeoff/landing detection and a delayed verification call after touchdown.
+> How it works: frames are extracted in the browser; Meta's SAM 3.1 segments the snowboard in each frame to confirm the board lock; airtime is found by judging board-to-snow contact frame by frame (which works on follow-cam footage, where frame height cannot); Muse Spark 1.3 estimates the rider's facing in each airborne frame, and those estimates unwrap and fit to a spin curve with total rotation, airtime, and peak/average spin rate; a separate, independent Spark call then verifies trick name, direction, and total from takeoff/mid-air/landing frames, and the two are shown side by side with a LOCKED / CLOSE / DISPUTED call. Results include a rotation dial synced to replay, a per-frame strip, a rotation-over-time chart, and a persistent run sheet. Live mode tracks from a camera feed with auto takeoff/landing detection and a delayed verification call after touchdown.
 >
 > The app is built for failure as much as for success: a live health gate refuses to start scans the models cannot serve, SAM failures fail fast with honest model errors (never disguised as "no board found"), every scan shows real progress with Cancel, and no run can sit in "processing" forever. The Meta API key lives only as a Cloudflare Worker secret — never in the browser, repo, or logs.
 

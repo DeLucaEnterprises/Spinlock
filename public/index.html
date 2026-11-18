@@ -236,7 +236,7 @@
         </div>
         <div>
           <canvas id="liveChart" class="chart" width="640" height="180"></canvas>
-          <p class="hint">Live rotation curve — measured angles only. Gaps mean SAM did not lock the board in that sample.</p>
+          <p class="hint">Live rotation dial is a provisional board-axis reading while tracking; the saved result uses the yaw-sequence estimate after landing. Gaps mean SAM did not lock the board in that sample.</p>
         </div>
       </div>
     </div>
@@ -286,7 +286,7 @@
       </div>
       <div>
         <canvas id="chart" class="chart" width="640" height="180"></canvas>
-        <p class="hint">Rotation over time. Solid points are measured frames; gaps are frames where SAM did not lock the board. The curve is unwrapped board-axis angle from SAM boxes + pixel moments (single camera — see limits in the footer).</p>
+        <p class="hint">Rotation over time. Solid points are the rider's unwrapped facing (yaw) per frame, fit to a steady spin curve. Gaps are frames with no confident yaw estimate. Single camera — see how SPINLOCK measures in the footer.</p>
       </div>
     </div>
     <h3 style="margin:18px 0 4px;font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--steel)">Frame strip — per-frame degrees</h3>
@@ -300,7 +300,7 @@
   </section>
 
   <footer>
-    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. SAM 3.1 (Meta) segments the snowboard in each frame. Board-axis angle comes from the SAM box plus pixel moments in that box, unwrapped across frames into a rotation curve. Takeoff/landing come from board height against the learned snow line. Muse Spark 1.3 (Meta) then verifies trick name, direction, and total from takeoff / mid-air / landing frames — shown side by side with the measured total. <b>LOCKED</b> means measured and verified totals agree within 45°. <b>CLOSE</b> within 120°. <b>DISPUTED</b> otherwise. No rotation, takeoff, or landing value is ever invented or filled in.
+    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. SAM 3.1 (Meta) segments the snowboard in each frame to confirm the board lock. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. Rotation comes from the rider's facing: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each airborne frame, the estimates are unwrapped and fit to a steady spin curve, and the total, peak, and average rates come from that fit. A separate, independent Spark call then verifies trick name, direction, and total from takeoff / mid-air / landing frames, with no measured numbers fed in. <b>LOCKED</b> means the curve fit and the independent verification agree within 45° with a confident, named trick. <b>CLOSE</b> within 120°. <b>DISPUTED</b> otherwise. <b>UNVERIFIED</b> means Spark could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
     <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs.
   </footer>
 </div>
@@ -308,8 +308,9 @@
 "use strict";
 /* =====================================================================
    SPINLOCK frontend — no build step, no external dependencies.
-   All measurement comes from SAM boxes + pixel moments. All verification
-   comes from Muse Spark. Failures are reported, never papered over.
+   SAM locks the board. Spark judges airtime and estimates facing (yaw);
+   the yaw estimates are fit to a spin curve. A separate independent
+   Spark call verifies. Failures are reported, never papered over.
    ===================================================================== */
 
 const $ = (id) => document.getElementById(id);
@@ -531,7 +532,10 @@ async function extractFrames(video, { fps, maxFrames, signal, onProgress }) {
 /**
  * Estimate the board's long-axis angle inside a SAM box by principal-axis
  * analysis of darker-than-snow pixels. Returns {angleDeg, pixels} or null.
- * This is a measurement estimate, not a guess: too few pixels => null.
+ * LIVE DIAL ONLY (provisional): this signal cannot measure a spin — the
+ * image-plane axis only oscillates as the board foreshortens, and it
+ * unwrapped to ~0° on a real 360. Clip and saved-live results use the
+ * yaw-sequence fit instead. Too few pixels => null.
  */
 function estimateBoardAngle(image, box) {
   return new Promise((resolve) => {
@@ -573,7 +577,7 @@ function estimateBoardAngle(image, box) {
   });
 }
 
-/** Unwrap axis angles (180°-periodic) into a cumulative rotation curve. */
+/** Unwrap axis angles (180°-periodic) into a cumulative curve. Live dial / live fallback only — see estimateBoardAngle note. */
 function unwrapAngles(samples) {
   // samples: [{time, angleDeg|null}] in time order. Returns cumulative degrees per sample (null where unknown).
   let cumulative = 0, prev = null, started = false;
@@ -610,25 +614,189 @@ function computeStats(curve, takeoffTime, landingTime) {
   };
 }
 
-/** Find the airborne stretch from board height vs the learned snow line. */
-function detectWindowFromCy(results) {
+/* ---------------- Airtime window: vision classification first ---------------- */
+/**
+ * Find the airborne stretch from Spark's per-frame airborne/ground calls.
+ * Single-frame gaps inside a run are bridged (one unsure frame does not
+ * split a jump). Takeoff/landing sit midway between the last ground frame
+ * and the first airborne frame (and vice versa), not on a sample.
+ * Returns {window, reason} or {window: null, reason}.
+ */
+function detectWindowFromAirtime(classifications, duration) {
+  const votes = classifications.map((c) => ({ ...c, air: c.airborne === true && c.confidence >= 0.5 }));
+  const bridged = votes.map((v, i) => {
+    if (v.air) return v;
+    const prev = votes[i - 1], next = votes[i + 1];
+    if (prev && next && prev.air && next.air) return { ...v, air: true };
+    return v;
+  });
+  let best = null, cur = null;
+  for (let i = 0; i < bridged.length; i++) {
+    if (bridged[i].air) {
+      if (!cur) cur = { startIdx: i, endIdx: i };
+      else cur.endIdx = i;
+    } else if (cur) {
+      if (!best || cur.endIdx - cur.startIdx > best.endIdx - best.startIdx) best = cur;
+      cur = null;
+    }
+  }
+  if (cur && (!best || cur.endIdx - cur.startIdx > best.endIdx - best.startIdx)) best = cur;
+  const airCount = bridged.filter((v) => v.air).length;
+  if (!best || best.endIdx - best.startIdx < 1) {
+    return { window: null, reason: `No sustained airborne stretch was found — only ${airCount} sampled frame(s) read as airborne. Try the manual window override around the trick.` };
+  }
+  const first = bridged[best.startIdx], last = bridged[best.endIdx];
+  const before = bridged[best.startIdx - 1];
+  const after = bridged[best.endIdx + 1];
+  const takeoff = before ? (before.time + first.time) / 2 : Math.max(0, first.time - 0.1);
+  const landing = after ? (last.time + after.time) / 2 : Math.min(duration, last.time + 0.1);
+  if (duration > 0 && landing - takeoff > 0.85 * duration) {
+    return { window: null, reason: "The airborne stretch covered nearly the whole clip, so no single trick window could be isolated. Try the manual window override around the trick." };
+  }
+  return {
+    window: {
+      start: Math.max(0, takeoff - 0.1), end: Math.min(duration, landing + 0.1),
+      takeoffTime: takeoff, landingTime: landing,
+    },
+    reason: `Airtime judged frame-by-frame (vision): board off the snow for ${best.endIdx - best.startIdx + 1} sampled frames, takeoff ~${takeoff.toFixed(2)}s, landing ~${landing.toFixed(2)}s.`,
+  };
+}
+
+/**
+ * Fallback window detection from SAM box height — used ONLY when the vision
+ * airtime call fails. Unlike the old global snow line, the baseline is
+ * local (ground level near each moment), runs must be contiguous, and a
+ * run covering most of the clip is rejected instead of reported as
+ * airtime. Still unreliable on follow-cam footage: camera tilt moves the
+ * ground reference. The run note always says when this fallback was used.
+ */
+function detectWindowFromCyDip(results) {
   const found = results.filter((r) => r.found && Number.isFinite(r.cy));
   if (found.length < 3) {
     const note = (results.find((r) => r.sam_note) || {}).sam_note;
     const diag = note ? ` SAM replied on a sample frame: “${String(note).slice(0, 160)}”` : "";
     return { window: null, reason: `Only ${found.length} frames locked the board — not enough to find an airborne stretch.${diag}` };
   }
-  const cys = found.map((r) => r.cy).sort((a, b) => a - b);
-  const snowLine = cys[Math.floor(cys.length * 0.9)]; // low in frame = on the snow
-  const airborne = found.filter((r) => r.cy < snowLine - 0.08);
-  if (airborne.length < 2) {
-    return { window: null, snowLine, reason: "No sustained airborne stretch was found — the board never rose clearly above the snow line in the sampled frames. Try the manual window override around the trick." };
+  // 3-point median smoothing kills single-frame box jitter.
+  const cys = found.map((r, i) => {
+    const w = [found[Math.max(0, i - 1)].cy, r.cy, found[Math.min(found.length - 1, i + 1)].cy].sort((a, b) => a - b);
+    return w[1];
+  });
+  // Local baseline: lowest-in-frame smoothed cy within ±2.5s = ground near that moment.
+  const air = found.map((r, i) => {
+    let base = -Infinity;
+    for (let j = 0; j < found.length; j++) {
+      if (Math.abs(found[j].time - r.time) <= 2.5) base = Math.max(base, cys[j]);
+    }
+    return cys[i] < base - 0.06;
+  });
+  const bridged = air.map((a, i) => Boolean(a || (air[i - 1] && air[i + 1])));
+  let best = null, cur = null;
+  for (let i = 0; i < bridged.length; i++) {
+    if (bridged[i]) { if (!cur) cur = { s: i, e: i }; else cur.e = i; }
+    else if (cur) { if (!best || cur.e - cur.s > best.e - best.s) best = cur; cur = null; }
   }
-  const takeoff = airborne[0], landing = airborne[airborne.length - 1];
+  if (cur && (!best || cur.e - cur.s > best.e - best.s)) best = cur;
+  if (!best || best.e - best.s < 1) {
+    return { window: null, reason: "No sustained airborne stretch was found — the board never rose clearly above the local snow level in the sampled frames. Try the manual window override around the trick." };
+  }
+  // Sharp-step guard: a real takeoff/landing moves fast between coarse
+  // samples (the rider leaves the snow in well under a second), while
+  // follow-cam drift creeps a few percent per sample. A V-shaped drift
+  // mimics a dip in height but never in step size — reject runs with no
+  // sharp step at either edge.
+  let sharp = false;
+  for (let i = Math.max(1, best.s); i <= Math.min(found.length - 1, best.e + 1); i++) {
+    if (Math.abs(cys[i] - cys[i - 1]) >= 0.05) { sharp = true; break; }
+  }
+  if (!sharp) {
+    return { window: null, reason: "The board-height signal drifted gradually with no sharp takeoff or landing step, which matches a moving camera more than a jump. Try the manual window override around the trick." };
+  }
+  const takeoff = found[best.s].time, landing = found[best.e].time;
+  const span = found[found.length - 1].time - found[0].time;
+  if (span > 0 && landing - takeoff > 0.85 * span) {
+    return { window: null, reason: "The board-height signal covered nearly the whole clip, so no single trick window could be isolated. Try the manual window override around the trick." };
+  }
   return {
-    window: { start: Math.max(0, takeoff.time - 0.15), end: landing.time + 0.15, takeoffTime: takeoff.time, landingTime: landing.time },
-    snowLine,
-    reason: `Snow line at ${Math.round(snowLine * 100)}% of frame height; board rose above it for ${airborne.length} sampled frames.`,
+    window: { start: Math.max(0, takeoff - 0.15), end: landing + 0.15, takeoffTime: takeoff, landingTime: landing },
+    reason: `Fallback window from board height (vision airtime check unavailable): board rose above the local snow level for ${best.e - best.s + 1} sampled frames.`,
+  };
+}
+
+/* ---------------- Rotation: per-frame yaw sequence ---------------- */
+/**
+ * Unwrap 360-periodic yaw estimates into a cumulative rotation curve.
+ * points: [{time, yaw_deg|null}] in time order. Steps clamp to ±180°.
+ * Frames without a yaw estimate break the line (cum_deg null).
+ */
+function unwrapYaw(points) {
+  let cumulative = 0, prev = null;
+  return points.map((p) => {
+    if (p.yaw_deg == null || !Number.isFinite(p.yaw_deg)) return { ...p, cum_deg: null };
+    if (prev == null) { prev = p.yaw_deg; return { ...p, cum_deg: 0 }; }
+    let d = p.yaw_deg - prev;
+    while (d > 180) d -= 360;
+    while (d < -180) d += 360;
+    cumulative += d;
+    prev = p.yaw_deg;
+    return { ...p, cum_deg: cumulative };
+  });
+}
+
+/** Least-squares line through (time, cum_deg). Returns {slope, intercept} or null. */
+function leastSquares(pts) {
+  if (pts.length < 2) return null;
+  const n = pts.length;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const p of pts) { sx += p.time; sy += p.cum_deg; sxx += p.time * p.time; sxy += p.time * p.cum_deg; }
+  const denom = n * sxx - sx * sx;
+  if (Math.abs(denom) < 1e-9) return null;
+  const slope = (n * sxy - sx * sy) / denom;
+  return { slope, intercept: (sy - slope * sx) / n };
+}
+
+/**
+ * Fit the spin curve: unwrap yaw, fit a line, drop points >60° off the
+ * line once, refit. A spin in the air runs at a roughly steady rate, so
+ * the fitted line resists single-frame misreads that would otherwise
+ * swing the total. Returns {curve, kept, dropped, stats} or {error}.
+ */
+function fitSpinCurve(points, takeoffTime, landingTime) {
+  const curve = unwrapYaw(points);
+  const usable = curve.filter((p) => p.cum_deg != null && (p.confidence == null || p.confidence >= 0.3));
+  if (usable.length < 3) {
+    return { error: `Only ${usable.length} confident yaw estimate(s) — need at least 3 to fit a spin curve. The clip may be too unclear, too far away, or the rider too small in frame.` };
+  }
+  let kept = usable;
+  let fit = leastSquares(kept);
+  let dropped = 0;
+  if (fit) {
+    const inliers = kept.filter((p) => Math.abs(p.cum_deg - (fit.slope * p.time + fit.intercept)) <= 60);
+    if (inliers.length >= 3 && inliers.length < kept.length) {
+      dropped = kept.length - inliers.length;
+      kept = inliers;
+      fit = leastSquares(kept);
+    }
+  }
+  if (!fit) return { error: "Yaw estimates could not be fit to a spin curve." };
+  const t0 = kept[0].time, t1 = kept[kept.length - 1].time;
+  const total = Math.abs(fit.slope * (t1 - t0));
+  let peak = 0;
+  for (let i = 1; i < kept.length; i++) {
+    const dt = kept[i].time - kept[i - 1].time;
+    if (dt > 0) peak = Math.max(peak, Math.abs(kept[i].cum_deg - kept[i - 1].cum_deg) / dt);
+  }
+  const airtime = Math.max(0, landingTime - takeoffTime);
+  return {
+    curve, kept, dropped, fit,
+    stats: {
+      total_degrees: total,
+      airtime_s: airtime,
+      peak_rate: peak,
+      avg_rate: airtime > 0 ? total / airtime : 0,
+      direction: fit.slope >= 0 ? "clockwise (as seen)" : "counter-clockwise (as seen)",
+      method: "spark-yaw-sequence",
+    },
   };
 }
 </script>
@@ -822,58 +990,95 @@ async function runAutoScan() {
       const start = Math.max(0, Number($("manualStart").value) || 0);
       const end = Math.max(start + 0.2, Number($("manualEnd").value) || 0);
       windowInfo = { window: { start, end, takeoffTime: start, landingTime: end }, reason: "Manual window override — takeoff/landing are the window edges you set." };
-      setClipProgress("Extracting frames in your window…", 0, 0, startedAt);
-      windowFrames = await extractFramesInRange(clipVideo, start, end, fps, 30, signal, (d, t) => setClipProgress("Extracting frames in your window…", d, t, startedAt));
     } else {
       setClipProgress("Extracting frames across the whole clip…", 0, 0, startedAt);
-      const coarse = await extractFrames(clipVideo, { fps: Math.min(fps, 6), maxFrames: 30, signal, onProgress: (d, t) => setClipProgress("Extracting frames across the whole clip…", d, t, startedAt) });
-      setClipProgress("SAM 3.1 is hunting for the board…", 0, coarse.length, startedAt);
-      const scanned = await samOverFrames(coarse, signal, "/api/detect", (d, t) => setClipProgress("SAM 3.1 is hunting for the board…", d, t, startedAt));
-      if (scanned.sam_errors > 0) run.notes.push(`SAM model errors on ${scanned.sam_errors} coarse-scan frame(s) — counted separately from no-board frames.`);
-      const foundCount = scanned.results.filter((r) => r.found).length;
-      const detected = detectWindowFromCy(scanned.results);
-      if (!detected.window) {
-        throw new Error(detected.reason + ` (Board locked in ${foundCount} of ${scanned.results.length} sampled frames.)`);
+      const coarse = await extractFrames(clipVideo, { fps: 2, maxFrames: 15, signal, onProgress: (d, t) => setClipProgress("Extracting frames across the whole clip…", d, t, startedAt) });
+      // Vision airtime classification first: it judges board-to-snow contact
+      // and works on follow-cam footage, where board-height geometry cannot
+      // (the camera tilts with the rider). SAM-height fallback only if it fails.
+      let detected = null, airtimeError = "";
+      setClipProgress("Spark is finding the airborne stretch…", 0, 0, startedAt);
+      try {
+        const ares = await fetch("/api/airtime", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ frames: coarse.map((f) => ({ index: f.index, time: f.time, image: f.image })) }),
+          signal,
+        });
+        const adata = await ares.json().catch(() => ({}));
+        if (!ares.ok || !adata.classifications) throw new Error(adata.error || `Server returned HTTP ${ares.status} on /api/airtime.`);
+        detected = detectWindowFromAirtime(adata.classifications, clipVideo.duration || 0);
+        if (!detected.window) throw new Error(detected.reason);
+      } catch (aerr) {
+        airtimeError = aerr.message || String(aerr);
+        run.notes.push("Vision airtime check did not produce a window (" + airtimeError + ") — falling back to board-height detection.");
+        setClipProgress("SAM 3.1 is hunting for the board…", 0, coarse.length, startedAt);
+        const scanned = await samOverFrames(coarse, signal, "/api/detect", (d, t) => setClipProgress("SAM 3.1 is hunting for the board…", d, t, startedAt));
+        if (scanned.sam_errors > 0) run.notes.push(`SAM model errors on ${scanned.sam_errors} coarse-scan frame(s) — counted separately from no-board frames.`);
+        detected = detectWindowFromCyDip(scanned.results);
+        if (!detected.window) {
+          throw new Error(detected.reason + ` (Vision check also failed: ${airtimeError})`);
+        }
+        run.notes.push("Window came from the board-height fallback, which is unreliable on follow-cam footage — check the window times against the clip.");
       }
       windowInfo = detected;
       run.notes.push(detected.reason);
-      setClipProgress("Extracting frames in the trick window…", 0, 0, startedAt);
-      windowFrames = await extractFramesInRange(clipVideo, detected.window.start, detected.window.end, fps, 30, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt));
     }
     run.window = windowInfo.window;
+    setClipProgress("Extracting frames in the trick window…", 0, 0, startedAt);
+    windowFrames = await extractFramesInRange(clipVideo, windowInfo.window.start, windowInfo.window.end, fps, 12, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt));
 
     setClipProgress("SAM 3.1 is tracking the board…", 0, windowFrames.length, startedAt);
     const analyzed = await samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is tracking the board…", d, t, startedAt));
     if (analyzed.sam_errors > 0) run.notes.push(`SAM model errors on ${analyzed.sam_errors} window frame(s) — counted separately from no-board frames.`);
     const byIndex = new Map(analyzed.results.map((r) => [r.index, r]));
 
-    // Board-axis angle per found frame (pixel moments inside the SAM box).
-    const samples = [];
-    for (const f of windowFrames) {
-      if (signal.aborted) throw new DOMException("Scan cancelled.", "AbortError");
-      const sam = byIndex.get(f.index);
-      let angle = null;
-      if (sam && sam.found && sam.box) {
-        const est = await estimateBoardAngle(f.image, sam.box);
-        if (est) angle = est.angleDeg;
-      }
-      samples.push({ index: f.index, time: f.time, found: !!(sam && sam.found), box: sam ? sam.box : null, cy: sam ? sam.cy : null, angleDeg: angle, image: f.image });
+    // Rotation from the yaw sequence: Spark estimates the rider's facing in
+    // each window frame; the estimates are unwrapped and fit to a spin curve.
+    // (Board-axis pixel geometry cannot measure a spin: it unwraps to ~0°
+    // on a real 360. It is no longer used for clip results.)
+    setClipProgress("Spark is estimating the spin…", 0, 0, startedAt);
+    const sres = await fetch("/api/sequence", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ frames: windowFrames.map((f) => ({ index: f.index, time: f.time, image: f.image })) }),
+      signal,
+    });
+    const sdata = await sres.json().catch(() => ({}));
+    if (!sres.ok || !sdata.sequence) {
+      throw new Error("Rotation estimation failed: " + (sdata.error || `Server returned HTTP ${sres.status} on /api/sequence.`) + ` The airtime window (${windowInfo.window.takeoffTime.toFixed(2)}s–${windowInfo.window.landingTime.toFixed(2)}s) was found — retry the scan; nothing was saved as a result.`);
     }
-    const curve = unwrapAngles(samples);
-    const stats = computeStats(curve, windowInfo.window.takeoffTime, windowInfo.window.landingTime);
-    if (!stats) throw new Error("Too few measured frames to build a rotation curve — SAM locked the board but angles could not be estimated. Try a closer/clearer clip.");
+    const seqByIndex = new Map(sdata.sequence.frames.map((s) => [s.index, s]));
+    const points = windowFrames.map((f) => {
+      const sam = byIndex.get(f.index);
+      const seq = seqByIndex.get(f.index);
+      return {
+        index: f.index, time: f.time,
+        found: !!(sam && sam.found), box: sam ? sam.box : null, cy: sam ? sam.cy : null,
+        yaw_deg: seq ? seq.yaw_deg : null, facing: seq ? seq.facing : "",
+        confidence: seq ? seq.confidence : 0,
+        image: f.image,
+      };
+    });
+    const fitted = fitSpinCurve(points, windowInfo.window.takeoffTime, windowInfo.window.landingTime);
+    if (fitted.error) throw new Error(fitted.error);
+    const stats = fitted.stats;
+    const meanConf = points.reduce((a, p) => a + (p.confidence || 0), 0) / Math.max(1, points.length);
+    run.notes.push(`Rotation from ${fitted.kept.length} yaw estimate(s) (mean confidence ${Math.round(meanConf * 100)}%) fit to a spin curve${fitted.dropped ? `; ${fitted.dropped} outlier(s) dropped` : ""}.`);
+    const sparkOverall = Number(sdata.sequence.total_degrees);
+    if (Number.isFinite(sparkOverall) && Math.abs(sparkOverall - stats.total_degrees) > 60) {
+      run.notes.push(`Spark's own overall estimate was ${Math.round(sparkOverall)}° vs the curve fit ${Math.round(stats.total_degrees)}° — the two disagree, so treat the total as rough.`);
+    }
     run.stats = stats;
 
-    // Thumbnails for the strip (storage-friendly) + measured curve.
+    // Thumbnails for the strip (storage-friendly) + fitted curve.
     const storedFrames = [];
-    for (const p of curve) {
-      storedFrames.push({ index: p.index, time: p.time, found: p.found, angle_deg: p.angleDeg, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
+    for (const p of fitted.curve) {
+      storedFrames.push({ index: p.index, time: p.time, found: p.found, angle_deg: p.yaw_deg, yaw_deg: p.yaw_deg, facing: p.facing, yaw_confidence: p.confidence, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
     }
     run.frames = storedFrames;
     run.window = windowInfo.window;
 
-    // Spark verification from 3 keyframes.
-    const foundSamples = curve.filter((p) => p.found);
+    // Spark verification from 3 keyframes (independent: no numbers fed in).
+    const foundSamples = fitted.curve.filter((p) => p.found);
     const keys = foundSamples.length >= 3
       ? [foundSamples[0], foundSamples[Math.floor(foundSamples.length / 2)], foundSamples[foundSamples.length - 1]]
       : foundSamples;
@@ -1005,7 +1210,7 @@ function renderResult(run) {
     const v = run.verification;
     $("verdictDetail").innerHTML =
       `<b>${esc(v.trick || "Unknown")}</b> · ${esc(v.direction || "unknown")} · Spark total <b>${fmtDeg(v.total_degrees)}</b> ` +
-      `vs measured <b>${s ? fmtDeg(s.total_degrees) : "—"}</b> · confidence ${Math.round((v.confidence || 0) * 100)}%<br>${esc(v.reason || "")}`;
+      `vs curve fit <b>${s ? fmtDeg(s.total_degrees) : "—"}</b> · confidence ${Math.round((v.confidence || 0) * 100)}%<br>${esc(v.reason || "")}`;
   } else {
     $("verdictDetail").textContent = run.status === "failed"
       ? ("No verification — run failed: " + (run.error || "unknown error"))
@@ -1260,9 +1465,38 @@ async function finishLiveSession(how) {
   const takeoff = live.takeoffTime != null ? live.takeoffTime : (live.samples[0] ? live.samples[0].time : 0);
   const landing = live.landingTime != null ? live.landingTime : (live.samples.length ? live.samples[live.samples.length - 1].time : takeoff);
   const windowSamples = live.samples.filter((s) => s.time >= takeoff - 0.01 && s.time <= landing + 0.01);
-  const curve = unwrapAngles(windowSamples.map((s) => ({ time: s.time, angleDeg: s.angleDeg })));
-  const merged = windowSamples.map((s, i) => ({ ...s, cum_deg: curve[i] ? curve[i].cum_deg : null }));
-  const stats = computeStats(merged, takeoff, landing);
+  // Prefer the yaw-sequence estimate (same as clips). Fall back to the
+  // provisional live board-axis curve only if the sequence call fails.
+  let stats = null, merged = null, seqNote = "";
+  const seqFrames = windowSamples.length > 12
+    ? windowSamples.filter((_, i) => i % Math.ceil(windowSamples.length / 12) === 0).slice(0, 12)
+    : windowSamples;
+  try {
+    const sres = await fetch("/api/sequence", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ frames: seqFrames.map((s, i) => ({ index: i, time: s.time, image: s.image })) }),
+    });
+    const sdata = await sres.json().catch(() => ({}));
+    if (sdata.sequence) {
+      const seqByIdx = new Map(sdata.sequence.frames.map((s) => [s.index, s]));
+      const points = seqFrames.map((s, i) => {
+        const seq = seqByIdx.get(i) || {};
+        return { ...s, yaw_deg: seq.yaw_deg != null ? seq.yaw_deg : null, facing: seq.facing || "", confidence: seq.confidence || 0 };
+      });
+      const fitted = fitSpinCurve(points, takeoff, landing);
+      if (!fitted.error) {
+        stats = fitted.stats;
+        merged = fitted.curve;
+        seqNote = `Live rotation from ${fitted.kept.length} yaw estimate(s) fit to a spin curve.`;
+      }
+    }
+  } catch { /* fall through to the provisional curve */ }
+  if (!stats) {
+    const curve = unwrapAngles(windowSamples.map((s) => ({ time: s.time, angleDeg: s.angleDeg })));
+    merged = windowSamples.map((s, i) => ({ ...s, cum_deg: curve[i] ? curve[i].cum_deg : null }));
+    stats = computeStats(merged, takeoff, landing);
+    seqNote = "Live rotation from the provisional board-axis curve (yaw-sequence estimate unavailable) — treat as rough.";
+  }
   if (!stats) {
     saveLiveRun(null, "Live session ended without enough measured frames to build a rotation curve.");
     return;
@@ -1285,7 +1519,7 @@ async function finishLiveSession(how) {
   }
   const storedFrames = [];
   for (const p of merged) {
-    storedFrames.push({ index: storedFrames.length, time: p.time, found: p.found, angle_deg: p.angleDeg, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
+    storedFrames.push({ index: storedFrames.length, time: p.time, found: p.found, angle_deg: p.yaw_deg != null ? p.yaw_deg : p.angleDeg, yaw_deg: p.yaw_deg != null ? p.yaw_deg : null, facing: p.facing || "", yaw_confidence: p.confidence || 0, cum_deg: p.cum_deg, cy: p.cy, thumb: await makeThumb(p.image, 160) });
   }
   const run = {
     id: "run-live-" + Date.now().toString(36),
@@ -1296,7 +1530,7 @@ async function finishLiveSession(how) {
     stats, verification,
     frames: storedFrames,
     window: { start: takeoff, end: landing, takeoffTime: takeoff, landingTime: landing },
-    notes: [verifyNote, `Takeoff/landing via ${how} detection.`].filter(Boolean),
+    notes: [seqNote, verifyNote, `Takeoff/landing via ${how} detection.`].filter(Boolean),
   };
   upsertRun(run);
   state.currentRunId = run.id;

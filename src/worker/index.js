@@ -10,7 +10,9 @@
  *   POST /api/detect      — batched SAM segmentation for coarse scan (<=8 frames/call)
  *   POST /api/analyze     — batched SAM segmentation for a trick window (<=8 frames/call)
  *   POST /api/live-frame  — single-frame SAM segmentation (live camera)
- *   POST /api/verify      — Muse Spark verification from 3 keyframes + measured summary
+ *   POST /api/airtime     — Spark per-frame airborne/ground classification (<=16 frames)
+ *   POST /api/sequence    — Spark per-frame yaw estimation over one trick (<=12 frames)
+ *   POST /api/verify      — Muse Spark independent verification from 3 keyframes
  *
  * Batching is deliberate: each Worker request stays short, the client gets
  * real progress ("SAM frame X of N"), Cancel aborts between batches, and a
@@ -22,6 +24,8 @@ import {
   MetaError,
   agreementFor,
   checkHealth,
+  classifyAirtime,
+  estimateYawSequence,
   segmentFrame,
   verifyTrick,
 } from "./meta.js";
@@ -168,20 +172,16 @@ async function handleVerify(request, env) {
   }
   const measuredTotal = Number(measured.total_degrees);
   try {
+    // Verification is independent: no measured numbers reach the prompt.
     const verification = await verifyTrick({
       apiKey: env.META_API_KEY,
       base: baseUrl(env),
       images,
-      measured: {
-        total_degrees: Number.isFinite(measuredTotal) ? Math.round(measuredTotal) : 0,
-        airtime_s: Number(measured.airtime_s) || 0,
-        direction: typeof measured.direction === "string" ? measured.direction : "unknown",
-      },
     });
     return json({
       ok: true,
       verification,
-      agreement: agreementFor(measuredTotal, verification.total_degrees),
+      agreement: agreementFor(measuredTotal, verification),
       model_error: false, error: "",
     });
   } catch (err) {
@@ -191,6 +191,60 @@ async function handleVerify(request, env) {
       verification: null,
       agreement: "UNVERIFIED",
       model_error: true,
+      error: err instanceof Error ? err.message : String(err),
+      status: isMeta ? err.status : 0,
+    });
+  }
+}
+
+function validFrameList(body, maxFrames) {
+  const frames = body && Array.isArray(body.frames) ? body.frames : null;
+  if (!frames || frames.length === 0) return { error: "Request body must include a non-empty frames array." };
+  if (frames.length > maxFrames) return { error: `Send at most ${maxFrames} frames per call. Got ${frames.length}.` };
+  for (const f of frames) {
+    if (!f || !isDataUrl(f.image) || !Number.isFinite(Number(f.time))) {
+      return { error: "Every frame must include an image data URL and a numeric time." };
+    }
+  }
+  return {
+    frames: frames.map((f) => ({ index: f.index, time: Number(f.time), image: f.image })),
+  };
+}
+
+async function handleAirtime(request, env) {
+  if (!env.META_API_KEY) return missingKeyResponse();
+  const body = await readJson(request);
+  const checked = validFrameList(body, 16);
+  if (checked.error) return json({ ok: false, error: checked.error }, 400);
+  try {
+    const classifications = await classifyAirtime({
+      apiKey: env.META_API_KEY, base: baseUrl(env), frames: checked.frames,
+    });
+    return json({ ok: true, classifications, model_error: false, error: "" });
+  } catch (err) {
+    const isMeta = err instanceof MetaError;
+    return json({
+      ok: true, classifications: null, model_error: true,
+      error: err instanceof Error ? err.message : String(err),
+      status: isMeta ? err.status : 0,
+    });
+  }
+}
+
+async function handleSequence(request, env) {
+  if (!env.META_API_KEY) return missingKeyResponse();
+  const body = await readJson(request);
+  const checked = validFrameList(body, 12);
+  if (checked.error) return json({ ok: false, error: checked.error }, 400);
+  try {
+    const sequence = await estimateYawSequence({
+      apiKey: env.META_API_KEY, base: baseUrl(env), frames: checked.frames,
+    });
+    return json({ ok: true, sequence, model_error: false, error: "" });
+  } catch (err) {
+    const isMeta = err instanceof MetaError;
+    return json({
+      ok: true, sequence: null, model_error: true,
       error: err instanceof Error ? err.message : String(err),
       status: isMeta ? err.status : 0,
     });
@@ -207,6 +261,8 @@ export default {
       if (path === "/api/detect" && request.method === "POST") return handleSamBatch(request, env, "detect");
       if (path === "/api/analyze" && request.method === "POST") return handleSamBatch(request, env, "analyze");
       if (path === "/api/live-frame" && request.method === "POST") return handleLiveFrame(request, env);
+      if (path === "/api/airtime" && request.method === "POST") return handleAirtime(request, env);
+      if (path === "/api/sequence" && request.method === "POST") return handleSequence(request, env);
       if (path === "/api/verify" && request.method === "POST") return handleVerify(request, env);
       if (path.startsWith("/api/")) {
         return json({ ok: false, error: `Unknown API route: ${path}` }, 404);

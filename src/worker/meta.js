@@ -196,20 +196,13 @@ export async function segmentFrame({ apiKey, base, image, timeoutMs = 30000 }) {
 }
 
 /**
- * Verify a trick with Muse Spark 1.3 from 3 keyframes + measured summary.
- * Returns the parsed verification object, or throws MetaError.
- * Never synthesizes a trick call: unparseable output is an error.
+ * One Spark vision call that must return strict JSON. Returns the parsed
+ * object. Throws MetaError when the reply has no usable JSON — the caller
+ * reports that honestly instead of inventing a result.
  */
-export async function verifyTrick({ apiKey, base, images, measured, timeoutMs = 45000 }) {
-  const prompt = [
-    "You are verifying a snowboard aerial trick from 3 frames: takeoff, mid-air, landing.",
-    `Measured from board tracking (estimate, single camera): total rotation ${measured.total_degrees} degrees, airtime ${measured.airtime_s} seconds, spin direction ${measured.direction || "unknown"}.`,
-    "Look at the frames and estimate the trick independently. Reply with JSON ONLY, no other text:",
-    '{"trick":"e.g. Backside 720","direction":"frontside|backside|unknown","total_degrees":720,"confidence":0.0-1.0,"reason":"one sentence citing what you see"}',
-    "If you cannot tell from the frames, use total_degrees 0, confidence 0, and say so in reason. Do not guess a trick name.",
-  ].join("\n");
+async function sparkJson({ apiKey, base, prompt, images, maxImages, timeoutMs }) {
   const content = [textPart(prompt)];
-  for (const img of images.slice(0, 3)) content.push(imagePart(img));
+  for (const img of images.slice(0, maxImages)) content.push(imagePart(img));
   const body = await callResponses({
     apiKey, base, model: SPARK_MODEL, input: [{ role: "user", content }], timeoutMs,
   });
@@ -217,33 +210,160 @@ export async function verifyTrick({ apiKey, base, images, measured, timeoutMs = 
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (!jsonMatch) {
     throw new MetaError(
-      `Spark verification returned no JSON: ${snippet(text, 200) || "(empty response)"}`,
+      `Spark returned no JSON: ${snippet(text, 200) || "(empty response)"}`,
       { status: 200, retryable: false },
     );
   }
-  let parsed;
   try {
-    parsed = JSON.parse(jsonMatch[0]);
+    return JSON.parse(jsonMatch[0]);
   } catch {
     throw new MetaError(
-      `Spark verification returned unparseable JSON: ${snippet(jsonMatch[0], 200)}`,
+      `Spark returned unparseable JSON: ${snippet(jsonMatch[0], 200)}`,
+      { status: 200, retryable: false },
+    );
+  }
+}
+
+function clamp01(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
+}
+
+/**
+ * Classify each frame of a coarse clip scan as airborne or on the snow.
+ * This exists because board height in the frame cannot detect airtime when
+ * the camera moves: a follow-cam pans and tilts with the rider, so the
+ * board's frame position stays roughly constant through the jump. Only a
+ * visual judgement of board-to-snow contact works on that footage.
+ * Returns one entry per input frame, in the same order.
+ * Throws MetaError when the reply does not cover every frame.
+ */
+export async function classifyAirtime({ apiKey, base, frames, timeoutMs = 60000 }) {
+  const frameList = frames.map((f, i) => `Frame ${i + 1} (t=${f.time.toFixed(2)}s)`).join(", ");
+  const prompt = [
+    "You are judging airtime in a snowboard clip. The camera may move (follow-cam), so judge by what you SEE, not by where the rider sits in the frame.",
+    `Frames in time order: ${frameList}.`,
+    "For EACH frame, decide: is the snowboarder AIRBORNE — the snowboard is off the snow with visible space between the board and the snow surface? Riding on the snow, including riding up a jump ramp, is NOT airborne. If the rider or board is not visible, answer airborne=false with low confidence.",
+    "Reply with JSON ONLY, no other text, one entry per frame in the same order:",
+    '{"frames":[{"index":1,"airborne":false,"confidence":0.95,"evidence":"board on snow"}]}',
+    "Use confidence below 0.5 when unsure. Do not guess: an honest low-confidence call is better than a confident wrong one.",
+  ].join("\n");
+  const parsed = await sparkJson({
+    apiKey, base, prompt, images: frames.map((f) => f.image), maxImages: 16, timeoutMs,
+  });
+  const list = Array.isArray(parsed.frames) ? parsed.frames : null;
+  if (!list || list.length !== frames.length) {
+    throw new MetaError(
+      `Spark airtime classification covered ${list ? list.length : 0} of ${frames.length} frames.`,
+      { status: 200, retryable: false },
+    );
+  }
+  return list.map((entry, i) => ({
+    index: frames[i].index,
+    time: frames[i].time,
+    airborne: entry && entry.airborne === true,
+    confidence: clamp01(entry && entry.confidence),
+    evidence: typeof (entry && entry.evidence) === "string" ? entry.evidence : "",
+  }));
+}
+
+/**
+ * Estimate the rider's facing (yaw) in each frame of one airborne trick.
+ * A spin is rotation about the rider's vertical axis, so the measurable
+ * signal from a single camera is the rider's facing over time — not the
+ * board's image-plane axis angle, which only oscillates as the board
+ * foreshortens and unwraps to ~0 on a real 360 (proven Nov 18).
+ * Yaw convention: 0 = chest facing the camera, 90 = chest facing the right
+ * side of the frame, 180 = back to the camera, 270 = chest facing the left
+ * side of the frame. Yaw increases in the clockwise direction as seen.
+ * Returns { frames: [{index,time,yaw_deg,facing,confidence}], total_degrees,
+ * direction, confidence }. Throws MetaError on incomplete replies.
+ */
+export async function estimateYawSequence({ apiKey, base, frames, timeoutMs = 60000 }) {
+  const frameList = frames.map((f, i) => `Frame ${i + 1} (t=${f.time.toFixed(2)}s)`).join(", ");
+  const prompt = [
+    "You are estimating a snowboarder's spin from frames in time order covering ONE airborne trick.",
+    `Frames: ${frameList}.`,
+    "For EACH frame, estimate the rider's chest-facing yaw angle in degrees: 0 = chest facing the camera, 90 = chest facing the right side of the frame, 180 = back to the camera, 270 = chest facing the left side of the frame. Yaw increases clockwise as seen by the camera. Always answer 0-359. Judge from the rider's chest, shoulders, and board orientation.",
+    "Also give facing (front/back/left-profile/right-profile/three-quarter) and confidence 0-1 per frame. If you cannot judge a frame, use confidence 0 and your best yaw estimate — never omit a frame.",
+    "Then estimate the overall spin: total_degrees (how far the rider rotated from the first frame to the last), direction as seen by the camera (clockwise/counter-clockwise), and overall confidence.",
+    "Reply with JSON ONLY, no other text, one entry per frame in the same order:",
+    '{"frames":[{"index":1,"yaw_deg":10,"facing":"front","confidence":0.8}],"total_degrees":360,"direction":"clockwise","confidence":0.8}',
+    "Do not guess a trick name. Report what the frames show.",
+  ].join("\n");
+  const parsed = await sparkJson({
+    apiKey, base, prompt, images: frames.map((f) => f.image), maxImages: 12, timeoutMs,
+  });
+  const list = Array.isArray(parsed.frames) ? parsed.frames : null;
+  if (!list || list.length !== frames.length) {
+    throw new MetaError(
+      `Spark yaw sequence covered ${list ? list.length : 0} of ${frames.length} frames.`,
       { status: 200, retryable: false },
     );
   }
   const total = Number(parsed.total_degrees);
   return {
+    frames: list.map((entry, i) => {
+      const yaw = Number(entry && entry.yaw_deg);
+      return {
+        index: frames[i].index,
+        time: frames[i].time,
+        yaw_deg: Number.isFinite(yaw) ? ((yaw % 360) + 360) % 360 : null,
+        facing: typeof (entry && entry.facing) === "string" ? entry.facing : "",
+        confidence: clamp01(entry && entry.confidence),
+      };
+    }),
+    total_degrees: Number.isFinite(total) ? total : 0,
+    direction: typeof parsed.direction === "string" ? parsed.direction : "unknown",
+    confidence: clamp01(parsed.confidence),
+  };
+}
+
+/**
+ * Verify a trick with Muse Spark 1.3 from 3 keyframes: takeoff, mid-air,
+ * landing. The estimate is INDEPENDENT: the prompt carries no measured
+ * numbers, so Spark cannot anchor on the sequence estimate it is meant
+ * to check. The comparison happens in code (agreementFor).
+ * Returns the parsed verification object, or throws MetaError.
+ * Never synthesizes a trick call: unparseable output is an error.
+ */
+export async function verifyTrick({ apiKey, base, images, timeoutMs = 45000 }) {
+  const prompt = [
+    "You are verifying a snowboard aerial trick from 3 frames: takeoff, mid-air, landing, in time order.",
+    "Look at the frames and estimate the trick from what you SEE only. No measured numbers are given to you, on purpose.",
+    "Reply with JSON ONLY, no other text:",
+    '{"trick":"e.g. Backside 720","direction":"frontside|backside|unknown","total_degrees":720,"confidence":0.0-1.0,"reason":"one sentence citing what you see"}',
+    'If you cannot tell from the frames, use trick "Unknown", total_degrees 0, confidence 0, and say so in reason. Do not guess a trick name.',
+  ].join("\n");
+  const parsed = await sparkJson({
+    apiKey, base, prompt, images, maxImages: 3, timeoutMs,
+  });
+  const total = Number(parsed.total_degrees);
+  return {
     trick: typeof parsed.trick === "string" ? parsed.trick : "Unknown",
     direction: typeof parsed.direction === "string" ? parsed.direction : "unknown",
     total_degrees: Number.isFinite(total) ? total : 0,
-    confidence: Number.isFinite(Number(parsed.confidence))
-      ? Math.max(0, Math.min(1, Number(parsed.confidence))) : 0,
+    confidence: clamp01(parsed.confidence),
     reason: typeof parsed.reason === "string" ? parsed.reason : "",
   };
 }
 
-/** Agreement between measured geometry and Spark verification. */
-export function agreementFor(measuredTotal, verifiedTotal) {
-  if (!Number.isFinite(measuredTotal) || !Number.isFinite(verifiedTotal)) return "UNVERIFIED";
+/**
+ * Agreement between the rotation-curve estimate and Spark verification.
+ * LOCKED requires a real, confident verification: a 0-degree estimate
+ * agreeing with a 0-degree "I cannot tell" is NOT agreement — it is two
+ * unknowns, and it must show UNVERIFIED (the Nov 18 bug: 0° vs 0° at 0%
+ * confidence displayed a green LOCKED badge).
+ */
+export function agreementFor(measuredTotal, verification) {
+  if (!verification || !Number.isFinite(measuredTotal)) return "UNVERIFIED";
+  const verifiedTotal = Number(verification.total_degrees);
+  const confidence = Number(verification.confidence);
+  const trick = typeof verification.trick === "string" ? verification.trick.trim().toLowerCase() : "";
+  if (!Number.isFinite(verifiedTotal)) return "UNVERIFIED";
+  if (!Number.isFinite(confidence) || confidence <= 0.05) return "UNVERIFIED";
+  if (!trick || trick === "unknown") return "UNVERIFIED";
+  if (measuredTotal === 0 && verifiedTotal === 0) return "UNVERIFIED";
   const diff = Math.abs(measuredTotal - verifiedTotal);
   if (diff <= 45) return "LOCKED";
   if (diff <= 120) return "CLOSE";
