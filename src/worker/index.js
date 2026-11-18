@@ -12,6 +12,7 @@
  *   POST /api/live-frame  — single-frame SAM segmentation (live camera)
  *   POST /api/airtime     — Spark per-frame airborne/ground classification (<=16 frames)
  *   POST /api/sequence    — Spark per-frame yaw estimation over one trick (<=12 frames)
+ *   POST /api/pose        — Spark coarse-facing judgement from one rider-crop contact sheet
  *   POST /api/verify      — Muse Spark independent verification from 3 keyframes
  *
  * Batching is deliberate: each Worker request stays short, the client gets
@@ -23,9 +24,11 @@ import {
   META_BASE_DEFAULT,
   MetaError,
   agreementFor,
+  bucketCycleTotal,
   checkHealth,
   classifyAirtime,
   estimateYawSequence,
+  poseFromSheet,
   segmentFrame,
   verifyTrick,
 } from "./meta.js";
@@ -71,7 +74,7 @@ function isDataUrl(value) {
  * Returns { results, sam_errors, model_ok, error }.
  * A transport/model failure is NEVER reported as "no board found".
  */
-async function runSamBatch({ apiKey, base, frames }) {
+async function runSamBatch({ apiKey, base, frames, concept = "snowboard" }) {
   const results = [];
   let samErrors = 0;
   let succeeded = 0;
@@ -83,7 +86,7 @@ async function runSamBatch({ apiKey, base, frames }) {
       continue;
     }
     try {
-      const seg = await segmentFrame({ apiKey, base, image: frame.image, timeoutMs: SAM_TIMEOUT_MS });
+      const seg = await segmentFrame({ apiKey, base, image: frame.image, concept, timeoutMs: SAM_TIMEOUT_MS });
       consecutiveErrors = 0;
       succeeded += 1;
       results.push({
@@ -133,10 +136,15 @@ async function handleSamBatch(request, env, kind) {
   if (frames.length > MAX_FRAMES_PER_CALL) {
     return json({ ok: false, error: `Send at most ${MAX_FRAMES_PER_CALL} frames per call (batched design). Got ${frames.length}.` }, 400);
   }
-  const out = await runSamBatch({ apiKey: env.META_API_KEY, base: baseUrl(env), frames });
+  // SAM concept is allowlisted: the client may ask for the board or the rider, nothing else.
+  const concept = body && typeof body.concept === "string" ? body.concept : "snowboard";
+  if (concept !== "snowboard" && concept !== "snowboarder") {
+    return json({ ok: false, error: `Unknown SAM concept: ${concept}.` }, 400);
+  }
+  const out = await runSamBatch({ apiKey: env.META_API_KEY, base: baseUrl(env), frames, concept });
   // HTTP 200 with model_ok:false when the model path failed but the API itself worked.
   // The client must check model_ok — it must never treat this as "no board".
-  return json({ ok: true, kind, ...out });
+  return json({ ok: true, kind, concept, ...out });
 }
 
 async function handleLiveFrame(request, env) {
@@ -251,6 +259,44 @@ async function handleSequence(request, env) {
   }
 }
 
+async function handlePose(request, env) {
+  if (!env.META_API_KEY) return missingKeyResponse();
+  const body = await readJson(request);
+  const sheet = body && body.sheet;
+  const times = body && Array.isArray(body.times) ? body.times.map(Number) : [];
+  if (!isDataUrl(sheet) || times.length === 0 || times.length > 16 || !times.every(Number.isFinite)) {
+    return json({ ok: false, error: "Request body must include a contact-sheet image data URL and 1–16 numeric tile times." }, 400);
+  }
+  try {
+    const pose = await poseFromSheet({
+      apiKey: env.META_API_KEY, base: baseUrl(env), sheet, times,
+    });
+    // The cross-check total comes from code (bucket-cycle unwrap of the
+    // coarse facings), not from the model's own total_degrees.
+    const bucket = bucketCycleTotal(pose.frames);
+    const measured = body && body.measured && typeof body.measured === "object" ? body.measured : {};
+    const measuredTotal = Number(measured.total_degrees);
+    const verification = bucket.error ? null : {
+      trick: pose.trick,
+      direction: pose.direction,
+      total_degrees: Math.abs(bucket.total_degrees),
+      confidence: pose.confidence,
+    };
+    return json({
+      ok: true, pose, bucket,
+      agreement: verification ? agreementFor(measuredTotal, verification) : "UNVERIFIED",
+      model_error: false, error: "",
+    });
+  } catch (err) {
+    const isMeta = err instanceof MetaError;
+    return json({
+      ok: true, pose: null, bucket: null, agreement: "UNVERIFIED", model_error: true,
+      error: err instanceof Error ? err.message : String(err),
+      status: isMeta ? err.status : 0,
+    });
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -263,6 +309,7 @@ export default {
       if (path === "/api/live-frame" && request.method === "POST") return handleLiveFrame(request, env);
       if (path === "/api/airtime" && request.method === "POST") return handleAirtime(request, env);
       if (path === "/api/sequence" && request.method === "POST") return handleSequence(request, env);
+      if (path === "/api/pose" && request.method === "POST") return handlePose(request, env);
       if (path === "/api/verify" && request.method === "POST") return handleVerify(request, env);
       if (path.startsWith("/api/")) {
         return json({ ok: false, error: `Unknown API route: ${path}` }, 404);

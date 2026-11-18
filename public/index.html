@@ -301,7 +301,7 @@
   </section>
 
   <footer>
-    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. SAM 3.1 (Meta) segments the snowboard in each frame to confirm the board lock. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. Rotation comes from the rider's facing: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each airborne frame, the estimates are unwrapped and fit to a steady spin curve, and the total, peak, and average rates come from that fit. A separate, independent Spark call then verifies trick name, direction, and total from takeoff / mid-air / landing frames, with no measured numbers fed in. <b>LOCKED</b> means the curve fit and the independent verification agree within 45° with a confident, named trick. <b>CLOSE</b> within 120°. <b>DISPUTED</b> otherwise. <b>UNVERIFIED</b> means Spark could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
+    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the total, peak, and average rates; and a separate pose-sheet call judges coarse facing (front / right / back / left) on one contact sheet of the same crops, turned into a rotation total in code. <b>LOCKED</b> means the curve fit and the pose-sheet total agree within 45° with a confident, named trick. <b>CLOSE</b> within 120°. <b>DISPUTED</b> otherwise. <b>UNVERIFIED</b> means the two checks could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
     <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs.
   </footer>
 </div>
@@ -800,6 +800,38 @@ function fitSpinCurve(points, takeoffTime, landingTime) {
     },
   };
 }
+
+/**
+ * Square crop rect (pixels) around a normalized SAM box, expanded by
+ * `margin` (fraction of the box size) and clamped inside the image.
+ * Squaring keeps the rider + board together and gives Spark a uniform,
+ * enlarged view — the fix for tiny-rider misreads (Nov 18: the rider was
+ * ~60px tall in full frames and per-frame yaw confabulated a smooth ramp).
+ * Null box => whole frame. Returns {sx, sy, sw, sh} in pixels.
+ */
+function cropRectForBox(box, imgW, imgH, margin) {
+  if (!box || !Number.isFinite(box.x1) || !Number.isFinite(box.y1) ||
+      !Number.isFinite(box.x2) || !Number.isFinite(box.y2)) {
+    return { sx: 0, sy: 0, sw: imgW, sh: imgH };
+  }
+  const m = Number.isFinite(margin) ? margin : 0.3;
+  const bw = Number.isFinite(box.w) ? box.w : (box.x2 - box.x1);
+  const bh = Number.isFinite(box.h) ? box.h : (box.y2 - box.y1);
+  let x1 = (box.x1 - m * bw) * imgW, y1 = (box.y1 - m * bh) * imgH;
+  let x2 = (box.x2 + m * bw) * imgW, y2 = (box.y2 + m * bh) * imgH;
+  // Square-ify by expanding the shorter side around the center.
+  let w = x2 - x1, h = y2 - y1;
+  const side = Math.max(w, h);
+  const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+  x1 = cx - side / 2; x2 = cx + side / 2;
+  y1 = cy - side / 2; y2 = cy + side / 2;
+  // Clamp: shift inside, then shrink if larger than the image.
+  const size = Math.min(side, imgW, imgH);
+  let sx = Math.max(0, Math.min(imgW - size, x1 + (side - size) / 2));
+  let sy = Math.max(0, Math.min(imgH - size, y1 + (side - size) / 2));
+  sx = Math.floor(sx); sy = Math.floor(sy);
+  return { sx, sy, sw: Math.floor(size), sh: Math.floor(size) };
+}
 </script>
 <script>
 "use strict";
@@ -868,12 +900,14 @@ $("manualToggle").addEventListener("change", (e) => {
 });
 
 /* ---------------- Batched SAM calls ---------------- */
-async function samBatch(frames, signal, endpoint) {
+async function samBatch(frames, signal, endpoint, concept) {
   const payload = frames.map((f) => ({ index: f.index, time: f.time, image: f.image }));
+  const body = { frames: payload };
+  if (concept) body.concept = concept;
   const res = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ frames: payload }),
+    body: JSON.stringify(body),
     signal,
   });
   const data = await res.json().catch(() => ({}));
@@ -883,13 +917,13 @@ async function samBatch(frames, signal, endpoint) {
   return data;
 }
 
-async function samOverFrames(frames, signal, endpoint, onBatch) {
+async function samOverFrames(frames, signal, endpoint, onBatch, concept) {
   const all = [];
   let totalErrors = 0;
   for (let i = 0; i < frames.length; i += BATCH) {
     if (signal.aborted) throw new DOMException("Scan cancelled.", "AbortError");
     const batch = frames.slice(i, i + BATCH);
-    const out = await samBatch(batch, signal, endpoint);
+    const out = await samBatch(batch, signal, endpoint, concept);
     totalErrors += out.sam_errors || 0;
     all.push(...(out.results || []));
     if (onBatch) onBatch(Math.min(i + BATCH, frames.length), frames.length);
@@ -919,12 +953,83 @@ function makeThumb(dataUrl, maxW) {
   });
 }
 
-async function extractFramesInRange(video, start, end, fps, maxFrames, signal, onProgress) {
+/**
+ * Crop a frame to the rider's SAM box (square, 30% margin) and return a
+ * 480px JPEG. Null box => the full frame resized to 480 wide (fallback;
+ * the caller counts it in the run notes).
+ */
+function cropRiderImage(dataUrl, box) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        if (!box) {
+          const scale = Math.min(1, 480 / img.width);
+          const c = document.createElement("canvas");
+          c.width = Math.max(1, Math.round(img.width * scale));
+          c.height = Math.max(1, Math.round(img.height * scale));
+          c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+          return resolve(c.toDataURL("image/jpeg", 0.8));
+        }
+        const r = cropRectForBox(box, img.width, img.height, 0.3);
+        const c = document.createElement("canvas");
+        c.width = 480; c.height = 480;
+        c.getContext("2d").drawImage(img, r.sx, r.sy, r.sw, r.sh, 0, 0, 480, 480);
+        resolve(c.toDataURL("image/jpeg", 0.8));
+      } catch (err) {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+/**
+ * Compose rider crops into one labeled contact sheet (4 columns, tiles
+ * 360px + time label bar), returned as a JPEG data URL. The pose call
+ * judges the whole trick from this one image.
+ */
+async function composeContactSheet(crops) {
+  const TILE = 360, LABEL = 40, COLS = 4;
+  const rows = Math.max(1, Math.ceil(crops.length / COLS));
+  const sheet = document.createElement("canvas");
+  sheet.width = COLS * TILE;
+  sheet.height = rows * (TILE + LABEL);
+  const ctx = sheet.getContext("2d");
+  ctx.fillStyle = "#0a0a0c";
+  ctx.fillRect(0, 0, sheet.width, sheet.height);
+  for (let i = 0; i < crops.length; i++) {
+    const col = i % COLS, row = Math.floor(i / COLS);
+    const x0 = col * TILE, y0 = row * (TILE + LABEL);
+    const img = await new Promise((resolve) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = () => resolve(null);
+      im.src = crops[i].image;
+    });
+    if (img) {
+      const scale = Math.min(TILE / img.width, TILE / img.height);
+      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+      ctx.drawImage(img, x0 + Math.round((TILE - w) / 2), y0 + Math.round((TILE - h) / 2), w, h);
+    }
+    ctx.fillStyle = "#141416";
+    ctx.fillRect(x0, y0 + TILE, TILE, LABEL);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 22px system-ui, sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`Tile ${i + 1} · ${crops[i].time.toFixed(2)}s`, x0 + 14, y0 + TILE + LABEL / 2);
+  }
+  return sheet.toDataURL("image/jpeg", 0.82);
+}
+
+async function extractFramesInRange(video, start, end, fps, maxFrames, signal, onProgress, targetWidth) {
   const duration = video.duration;
   const s = Math.max(0, start), e = Math.min(duration, Math.max(s + 0.2, end));
   const count = Math.max(2, Math.min(maxFrames, Math.floor((e - s) * fps) + 1));
   const vw = video.videoWidth || 640, vh = video.videoHeight || 360;
-  const scale = Math.min(1, 480 / vw);
+  const tw = Number.isFinite(targetWidth) && targetWidth > 0 ? targetWidth : 480;
+  const scale = Math.min(1, tw / vw);
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(2, Math.round(vw * scale));
   canvas.height = Math.max(2, Math.round(vh * scale));
@@ -1026,21 +1131,43 @@ async function runAutoScan() {
     }
     run.window = windowInfo.window;
     setClipProgress("Extracting frames in the trick window…", 0, 0, startedAt);
-    windowFrames = await extractFramesInRange(clipVideo, windowInfo.window.start, windowInfo.window.end, fps, 12, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt));
+    // Window frames at up to 960 wide: SAM boxes and rider crops need the
+    // resolution — at 480 the rider is ~60px tall and facing is unreadable.
+    windowFrames = await extractFramesInRange(clipVideo, windowInfo.window.start, windowInfo.window.end, fps, 12, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt), 960);
 
     setClipProgress("SAM 3.1 is tracking the board…", 0, windowFrames.length, startedAt);
     const analyzed = await samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is tracking the board…", d, t, startedAt));
     if (analyzed.sam_errors > 0) run.notes.push(`SAM model errors on ${analyzed.sam_errors} window frame(s) — counted separately from no-board frames.`);
     const byIndex = new Map(analyzed.results.map((r) => [r.index, r]));
 
-    // Rotation from the yaw sequence: Spark estimates the rider's facing in
-    // each window frame; the estimates are unwrapped and fit to a spin curve.
-    // (Board-axis pixel geometry cannot measure a spin: it unwraps to ~0°
-    // on a real 360. It is no longer used for clip results.)
+    // Rider boxes for crop-to-rider measurement: the rider (dark jacket,
+    // red pants) is a far bigger, higher-contrast SAM target than the
+    // thin board, and enlarged crops are what make facing readable.
+    setClipProgress("SAM 3.1 is locking onto the rider…", 0, windowFrames.length, startedAt);
+    const riderScanned = await samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is locking onto the rider…", d, t, startedAt), "snowboarder");
+    if (riderScanned.sam_errors > 0) run.notes.push(`SAM model errors on ${riderScanned.sam_errors} rider-lock frame(s).`);
+    const riderByIndex = new Map(riderScanned.results.map((r) => [r.index, r]));
+    const riderFound = riderScanned.results.filter((r) => r.found).length;
+    run.notes.push(`Rider locked in ${riderFound} of ${windowFrames.length} window frame(s) for enlarged crops.`);
+    setClipProgress("Cropping in on the rider…", 0, 0, startedAt);
+    const crops = [];
+    let cropFallbacks = 0;
+    for (const f of windowFrames) {
+      const rb = riderByIndex.get(f.index);
+      const box = rb && rb.found ? rb.box : null;
+      if (!box) cropFallbacks++;
+      crops.push({ index: f.index, time: f.time, image: await cropRiderImage(f.image, box) });
+    }
+    if (cropFallbacks > 0) run.notes.push(`${cropFallbacks} frame(s) had no rider box, so those measurements used the full frame instead of a crop.`);
+
+    // Rotation from the yaw sequence on CROPS: Spark estimates the rider's
+    // facing in each enlarged crop; the estimates are unwrapped and fit
+    // to a spin curve. (Board-axis pixel geometry cannot measure a spin:
+    // it unwraps to ~0° on a real 360. It is no longer used for results.)
     setClipProgress("Spark is estimating the spin…", 0, 0, startedAt);
     const sres = await fetch("/api/sequence", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ frames: windowFrames.map((f) => ({ index: f.index, time: f.time, image: f.image })) }),
+      body: JSON.stringify({ frames: crops.map((f) => ({ index: f.index, time: f.time, image: f.image })) }),
       signal,
     });
     const sdata = await sres.json().catch(() => ({}));
@@ -1062,8 +1189,9 @@ async function runAutoScan() {
     const fitted = fitSpinCurve(points, windowInfo.window.takeoffTime, windowInfo.window.landingTime);
     if (fitted.error) throw new Error(fitted.error);
     const stats = fitted.stats;
+    stats.method = "rider-crop yaw + pose-sheet cross-check";
     const meanConf = points.reduce((a, p) => a + (p.confidence || 0), 0) / Math.max(1, points.length);
-    run.notes.push(`Rotation from ${fitted.kept.length} yaw estimate(s) (mean confidence ${Math.round(meanConf * 100)}%) fit to a spin curve${fitted.dropped ? `; ${fitted.dropped} outlier(s) dropped` : ""}.`);
+    run.notes.push(`Rotation from ${fitted.kept.length} yaw estimate(s) on enlarged rider crops (mean confidence ${Math.round(meanConf * 100)}%) fit to a spin curve${fitted.dropped ? `; ${fitted.dropped} outlier(s) dropped` : ""}.`);
     const sparkOverall = Number(sdata.sequence.total_degrees);
     if (Number.isFinite(sparkOverall) && Math.abs(sparkOverall - stats.total_degrees) > 60) {
       run.notes.push(`Spark's own overall estimate was ${Math.round(sparkOverall)}° vs the curve fit ${Math.round(stats.total_degrees)}° — the two disagree, so treat the total as rough.`);
@@ -1078,31 +1206,54 @@ async function runAutoScan() {
     run.frames = storedFrames;
     run.window = windowInfo.window;
 
-    // Spark verification from 3 keyframes (independent: no numbers fed in).
-    const foundSamples = fitted.curve.filter((p) => p.found);
-    const keys = foundSamples.length >= 3
-      ? [foundSamples[0], foundSamples[Math.floor(foundSamples.length / 2)], foundSamples[foundSamples.length - 1]]
-      : foundSamples;
-    setClipProgress("Muse Spark is verifying the trick…", 0, 0, startedAt);
+    // Pose-sheet cross-check: one contact sheet of the enlarged crops,
+    // judged as coarse 4-way facing per tile. The Worker turns the facing
+    // progression into a rotation total in code (bucket-cycle unwrap) and
+    // compares it with the yaw-curve fit. No measured numbers reach the
+    // pose prompt, so the check stays independent.
+    setClipProgress("Muse Spark is judging the pose sheet…", 0, 0, startedAt);
     try {
-      const vres = await fetch("/api/verify", {
+      const sheet = await composeContactSheet(crops);
+      const pres = await fetch("/api/pose", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          images: keys.map((k) => k.image),
+          sheet,
+          times: crops.map((c) => c.time),
           measured: { total_degrees: Math.round(stats.total_degrees), airtime_s: Number(stats.airtime_s.toFixed(2)), direction: stats.direction },
         }),
         signal,
       });
-      const vdata = await vres.json().catch(() => ({}));
-      if (vdata.verification) {
-        run.verification = { ...vdata.verification, agreement: vdata.agreement || "UNVERIFIED" };
+      const pdata = await pres.json().catch(() => ({}));
+      if (pdata.pose) {
+        const pose = pdata.pose;
+        const bucket = pdata.bucket || {};
+        const facingWords = { toward_camera: "front", facing_right: "right", away_from_camera: "back", facing_left: "left", unknown: "?" };
+        if (!bucket.error && Array.isArray(bucket.sequence)) {
+          run.notes.push(`Pose sheet facing: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident tiles, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
+          run.verification = {
+            trick: pose.trick, direction: pose.direction,
+            total_degrees: Math.abs(bucket.total_degrees),
+            confidence: pose.confidence,
+            reason: (pose.reason || "") + ` Pose-sheet total ${Math.round(Math.abs(bucket.total_degrees))}° from the facing progression; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.`,
+            agreement: pdata.agreement || "UNVERIFIED",
+          };
+        } else {
+          run.verification = {
+            trick: pose.trick || "Unknown", direction: pose.direction || "unknown",
+            total_degrees: Number(pose.total_degrees) || 0,
+            confidence: pose.confidence || 0,
+            reason: (pose.reason || "") + " Pose-sheet facing progression was inconclusive: " + (bucket.error || "unknown bucket error") + ".",
+            agreement: "UNVERIFIED",
+          };
+          run.notes.push("Pose-sheet cross-check inconclusive: " + (bucket.error || "unknown bucket error") + ". Measured stats above are still real; the trick call stays unverified.");
+        }
       } else {
         run.verification = null;
-        run.notes.push("Spark verification did not return a call: " + (vdata.error || "unknown verification error") + ". Measured stats above are still real; the trick call is honestly unverified.");
+        run.notes.push("Pose-sheet check did not return a call: " + (pdata.error || "unknown pose error") + ". Measured stats above are still real; the trick call is honestly unverified.");
       }
-    } catch (verr) {
+    } catch (perr) {
       run.verification = null;
-      run.notes.push("Spark verification failed: " + (verr.message || String(verr)) + ". Measured stats above are still real; the trick call is honestly unverified.");
+      run.notes.push("Pose-sheet check failed: " + (perr.message || String(perr)) + ". Measured stats above are still real; the trick call is honestly unverified.");
     }
 
     run.status = "complete";
@@ -1210,7 +1361,7 @@ function renderResult(run) {
   if (run.verification) {
     const v = run.verification;
     $("verdictDetail").innerHTML =
-      `<b>${esc(v.trick || "Unknown")}</b> · ${esc(v.direction || "unknown")} · Spark total <b>${fmtDeg(v.total_degrees)}</b> ` +
+      `<b>${esc(v.trick || "Unknown")}</b> · ${esc(v.direction || "unknown")} · Cross-check total <b>${fmtDeg(v.total_degrees)}</b> ` +
       `vs curve fit <b>${s ? fmtDeg(s.total_degrees) : "—"}</b> · confidence ${Math.round((v.confidence || 0) * 100)}%<br>${esc(v.reason || "")}`;
   } else {
     $("verdictDetail").textContent = run.status === "failed"

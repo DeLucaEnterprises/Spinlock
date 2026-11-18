@@ -159,10 +159,12 @@ function textPart(text) {
 }
 
 /**
- * Segment the snowboard in one frame.
+ * Segment one concept in one frame. `concept` is ONE SHORT PHRASE:
+ * "snowboard" (the board, for board lock) or "snowboarder" (the rider,
+ * for crop-to-rider measurement). Defaults to "snowboard".
  * Returns { found, box|null, boxesChecked, raw_snippet }.
  * Throws MetaError on model/transport failure (caller counts it, never
- * confuses it with "no board").
+ * confuses it with "not found").
  *
  * SAM 3.1 takes ONE SHORT CONCEPT PHRASE per request (verified shape:
  * ARGUS step-5 smoke test used "person"; the Nov 9 Model API check used
@@ -172,12 +174,12 @@ function textPart(text) {
  * carries the first 200 chars of SAM's reply text so a no-box result
  * can show what the model actually said; it never contains the key.
  */
-export async function segmentFrame({ apiKey, base, image, timeoutMs = 30000 }) {
+export async function segmentFrame({ apiKey, base, image, concept = "snowboard", timeoutMs = 30000 }) {
   const input = [{
     type: "message",
     role: "user",
     content: [
-      textPart("snowboard"),
+      textPart(concept),
       imagePart(image),
     ],
   }];
@@ -316,6 +318,127 @@ export async function estimateYawSequence({ apiKey, base, frames, timeoutMs = 60
     total_degrees: Number.isFinite(total) ? total : 0,
     direction: typeof parsed.direction === "string" ? parsed.direction : "unknown",
     confidence: clamp01(parsed.confidence),
+  };
+}
+
+export const POSE_FACINGS = ["toward_camera", "facing_right", "away_from_camera", "facing_left", "unknown"];
+
+const POSE_BUCKET_ANGLE = {
+  toward_camera: 0,
+  facing_right: 90,
+  away_from_camera: 180,
+  facing_left: 270,
+};
+
+/**
+ * Turn a coarse facing sequence into a rotation total (code, not model
+ * assertion): map each confident facing to its bucket angle, unwrap, and
+ * take the net span. A real spin is monotonic, so a progression that
+ * reverses heavily is inconclusive instead of a number.
+ * Returns { total_degrees (signed), direction, kept, sequence } or { error }.
+ */
+export function bucketCycleTotal(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  const kept = list.filter((e) => {
+    const a = POSE_BUCKET_ANGLE[e && e.facing];
+    return a !== undefined && Number(e && e.confidence) >= 0.5;
+  });
+  if (kept.length < 4) {
+    return { error: `Only ${kept.length} confident facing call(s) on the pose sheet — need at least 4.` };
+  }
+  const t0 = Number(list[0].time), t1 = Number(list[list.length - 1].time);
+  const span = Number.isFinite(t0) && Number.isFinite(t1) ? t1 - t0 : 0;
+  const keptSpan = Number(kept[kept.length - 1].time) - Number(kept[0].time);
+  if (span > 0 && keptSpan < 0.5 * span) {
+    return { error: "Confident facing calls do not span the trick window." };
+  }
+  let cumulative = 0, prev = null, reversals = 0;
+  const angles = kept.map((e) => POSE_BUCKET_ANGLE[e.facing]);
+  for (const a of angles) {
+    if (prev == null) { prev = a; continue; }
+    let d = a - prev;
+    while (d > 180) d -= 360;
+    while (d < -180) d += 360;
+    cumulative += d;
+    prev = a;
+  }
+  // Reversal check: steps opposing the net direction must stay small.
+  const net = cumulative;
+  prev = null;
+  for (const a of angles) {
+    if (prev == null) { prev = a; continue; }
+    let d = a - prev;
+    while (d > 180) d -= 360;
+    while (d < -180) d += 360;
+    if ((net >= 0 && d < 0) || (net < 0 && d > 0)) reversals += Math.abs(d);
+    prev = a;
+  }
+  if (reversals > 90) {
+    return { error: `Facing progression reverses by ${Math.round(reversals)}° — no steady spin to measure.` };
+  }
+  return {
+    total_degrees: net,
+    direction: net >= 0 ? "clockwise (as seen)" : "counter-clockwise (as seen)",
+    kept: kept.length,
+    sequence: kept.map((e) => e.facing),
+  };
+}
+
+/**
+ * Judge a spin from ONE contact sheet: the rider cropped and enlarged in
+ * every window frame, in time order, each tile labeled with its time.
+ * This is the cross-check for the yaw-sequence fit, and it exists because
+ * per-frame absolute yaw on full frames failed on the real 360 clip
+ * (Nov 18: rider ~60px tall, yaw fit said 198°, verifier saw no spin).
+ * Coarse 4-way facing on enlarged crops is a much easier judgement than
+ * an exact angle on a tiny rider, and the sheet lets the model compare
+ * poses across the whole trick instead of rating frames in isolation.
+ * The facing progression is turned into a rotation total in code
+ * (bucket-cycle unwrap), never trusted from the model's own total alone.
+ * Returns { frames: [{index,time,facing,confidence,evidence}], trick,
+ * direction, total_degrees, confidence, reason }.
+ * Throws MetaError when the reply does not cover every tile.
+ */
+export async function poseFromSheet({ apiKey, base, sheet, times, timeoutMs = 60000 }) {
+  const tileList = times.map((t, i) => `Tile ${i + 1} (t=${t.toFixed(2)}s)`).join(", ");
+  const prompt = [
+    "You are judging ONE snowboard aerial trick from a contact sheet. The sheet shows the SAME rider cropped and enlarged in each frame, in time order, left to right, top to bottom. Each tile is labeled with its time.",
+    `Tiles: ${tileList}.`,
+    "For EACH tile, judge the rider's chest-facing bucket from what is VISIBLE in that tile only:",
+    "- toward_camera: chest/face toward the camera (goggles or face visible, chest facing you).",
+    "- facing_right: chest facing the right side of the frame (left profile).",
+    "- away_from_camera: back to the camera (back of jacket/helmet, no face).",
+    "- facing_left: chest facing the left side of the frame (right profile).",
+    "- unknown: the facing cannot be told from this tile.",
+    "Judge from visible features: goggles/face direction, chest vs back of the jacket, shoulder line, and board angle. If a tile is ambiguous, say unknown with low confidence — never guess a facing to make a smooth progression. Do NOT assume a spin is happening; report only what each tile shows.",
+    "Then estimate the overall trick: trick name (e.g. Frontside 360, Backside 540, or Unknown), direction as seen by the camera (clockwise/counter-clockwise/unknown), total_degrees (how far the rider rotated from the first tile to the last, from the facing progression), overall confidence, and one reason sentence citing what you see across the sheet.",
+    "Reply with JSON ONLY, no other text, one entry per tile in the same order:",
+    '{"frames":[{"index":1,"facing":"away_from_camera","confidence":0.9,"evidence":"back of jacket, no face visible"}],"trick":"Frontside 360","direction":"clockwise","total_degrees":360,"confidence":0.8,"reason":"Facing cycles back, left, front, right, back across the sheet."}',
+  ].join("\n");
+  const parsed = await sparkJson({
+    apiKey, base, prompt, images: [sheet], maxImages: 1, timeoutMs,
+  });
+  const list = Array.isArray(parsed.frames) ? parsed.frames : null;
+  if (!list || list.length !== times.length) {
+    throw new MetaError(
+      `Spark pose sheet covered ${list ? list.length : 0} of ${times.length} tiles.`,
+      { status: 200, retryable: false },
+    );
+  }
+  const total = Number(parsed.total_degrees);
+  return {
+    frames: list.map((entry, i) => ({
+      index: i,
+      time: times[i],
+      facing: POSE_FACINGS.includes(entry && entry.facing) ? entry.facing : "unknown",
+      confidence: clamp01(entry && entry.confidence),
+      evidence: typeof (entry && entry.evidence) === "string" ? entry.evidence : "",
+    })),
+    trick: typeof parsed.trick === "string" ? parsed.trick : "Unknown",
+    direction: typeof parsed.direction === "string" ? parsed.direction : "unknown",
+    total_degrees: Number.isFinite(total) ? total : 0,
+    confidence: clamp01(parsed.confidence),
+    reason: typeof parsed.reason === "string" ? parsed.reason : "",
   };
 }
 
