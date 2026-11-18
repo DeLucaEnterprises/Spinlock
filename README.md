@@ -130,6 +130,8 @@ npm run deploy
 
 Open the deployed URL, confirm the health badge is live, and run one starter-pack clip end to end (see [First test](#first-test)). That deployed URL is the submission link.
 
+> **Automatic deploys (connected Nov 18, 2026):** the `spinlock` Worker is connected to this repo via Cloudflare Workers Builds (Settings → Builds, branch `main`, deploy command `npx wrangler deploy`). Every push to `main` builds and deploys automatically — no laptop command needed. The `META_API_KEY` secret lives on the Worker and is untouched by deploys.
+
 ### Useful commands
 
 | Command | What it does |
