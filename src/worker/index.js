@@ -86,6 +86,7 @@ async function runSamBatch({ apiKey, base, frames }) {
         index: frame.index, time: frame.time,
         found: seg.found, box: seg.box,
         cx: seg.box ? seg.box.cx : null, cy: seg.box ? seg.box.cy : null,
+        sam_note: seg.found ? null : (seg.raw_snippet || null),
       });
     } catch (err) {
       samErrors += 1;
@@ -145,6 +146,7 @@ async function handleLiveFrame(request, env) {
     return json({
       ok: true, found: seg.found, box: seg.box,
       cx: seg.box ? seg.box.cx : null, cy: seg.box ? seg.box.cy : null,
+      sam_note: seg.found ? null : (seg.raw_snippet || null),
       model_error: false, error: "",
     });
   } catch (err) {

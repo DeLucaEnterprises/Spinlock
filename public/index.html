@@ -614,7 +614,9 @@ function computeStats(curve, takeoffTime, landingTime) {
 function detectWindowFromCy(results) {
   const found = results.filter((r) => r.found && Number.isFinite(r.cy));
   if (found.length < 3) {
-    return { window: null, reason: `Only ${found.length} frames locked the board — not enough to find an airborne stretch.` };
+    const note = (results.find((r) => r.sam_note) || {}).sam_note;
+    const diag = note ? ` SAM replied on a sample frame: “${String(note).slice(0, 160)}”` : "";
+    return { window: null, reason: `Only ${found.length} frames locked the board — not enough to find an airborne stretch.${diag}` };
   }
   const cys = found.map((r) => r.cy).sort((a, b) => a - b);
   const snowLine = cys[Math.floor(cys.length * 0.9)]; // low in frame = on the snow

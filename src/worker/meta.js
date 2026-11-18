@@ -52,14 +52,14 @@ async function fetchTimeout(url, options, timeoutMs) {
  * Retries exactly once on HTTP >= 500 or network/timeout failure.
  * Returns the parsed JSON body (or { _rawText } if the body is not JSON).
  */
-export async function callResponses({ apiKey, base, model, input, timeoutMs = 30000 }) {
+export async function callResponses({ apiKey, base, model, input, metadata, timeoutMs = 30000 }) {
   const url = `${base.replace(/\/$/, "")}/responses`;
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     const res = await fetchTimeout(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, input }),
+      body: JSON.stringify(metadata ? { model, input, metadata } : { model, input }),
       redirect: "manual",
     }, timeoutMs).catch((err) => {
       lastError = err;
@@ -160,24 +160,39 @@ function textPart(text) {
 
 /**
  * Segment the snowboard in one frame.
- * Returns { found, box|null, boxesChecked }.
+ * Returns { found, box|null, boxesChecked, raw_snippet }.
  * Throws MetaError on model/transport failure (caller counts it, never
  * confuses it with "no board").
+ *
+ * SAM 3.1 takes ONE SHORT CONCEPT PHRASE per request (verified shape:
+ * ARGUS step-5 smoke test used "person"; the Nov 9 Model API check used
+ * "red circle"). A long instruction sentence is not a concept and
+ * returns no boxes — that was the 0/30 failure on the first real clip.
+ * The metadata block matches the verified ARGUS shape. raw_snippet
+ * carries the first 200 chars of SAM's reply text so a no-box result
+ * can show what the model actually said; it never contains the key.
  */
 export async function segmentFrame({ apiKey, base, image, timeoutMs = 30000 }) {
   const input = [{
+    type: "message",
     role: "user",
     content: [
-      textPart("Find the snowboard in this image. Return exactly one bounding box for the snowboard itself using the box format. If no snowboard is clearly visible, return no box."),
+      textPart("snowboard"),
       imagePart(image),
     ],
   }];
-  const body = await callResponses({ apiKey, base, model: SAM_MODEL, input, timeoutMs });
+  const body = await callResponses({
+    apiKey, base, model: SAM_MODEL, input, timeoutMs,
+    metadata: { mask_encoding: "one_bit", include_confidence: "true" },
+  });
   // Search the full payload text: box grammar may sit in any output field.
   const haystack = responseText(body) + "\n" + JSON.stringify(body);
   const boxes = parseBoxes(haystack);
   const box = largestBox(boxes);
-  return { found: Boolean(box), box, boxesChecked: boxes.length };
+  return {
+    found: Boolean(box), box, boxesChecked: boxes.length,
+    raw_snippet: snippet(responseText(body), 200),
+  };
 }
 
 /**
