@@ -12,7 +12,7 @@
  *   POST /api/live-frame  — single-frame SAM segmentation (live camera)
  *   POST /api/airtime     — Spark per-frame airborne/ground classification (<=16 frames)
  *   POST /api/sequence    — Spark per-frame yaw estimation over one trick (<=12 frames)
- *   POST /api/pose        — Spark coarse-facing judgement from one rider-crop contact sheet
+ *   POST /api/pose        — Spark coarse-facing judgement on rider crops (<=12 frames) + completed-cycle total
  *   POST /api/verify      — Muse Spark independent verification from 3 keyframes
  *
  * Batching is deliberate: each Worker request stays short, the client gets
@@ -27,9 +27,11 @@ import {
   bucketCycleTotal,
   checkHealth,
   classifyAirtime,
+  cycleAgreement,
   estimateYawSequence,
-  poseFromSheet,
+  poseFromCrops,
   segmentFrame,
+  snapCycleTotal,
   verifyTrick,
 } from "./meta.js";
 
@@ -262,35 +264,42 @@ async function handleSequence(request, env) {
 async function handlePose(request, env) {
   if (!env.META_API_KEY) return missingKeyResponse();
   const body = await readJson(request);
-  const sheet = body && body.sheet;
-  const times = body && Array.isArray(body.times) ? body.times.map(Number) : [];
-  if (!isDataUrl(sheet) || times.length === 0 || times.length > 16 || !times.every(Number.isFinite)) {
-    return json({ ok: false, error: "Request body must include a contact-sheet image data URL and 1–16 numeric tile times." }, 400);
-  }
+  const checked = validFrameList(body, 12);
+  if (checked.error) return json({ ok: false, error: checked.error }, 400);
   try {
-    const pose = await poseFromSheet({
-      apiKey: env.META_API_KEY, base: baseUrl(env), sheet, times,
+    const pose = await poseFromCrops({
+      apiKey: env.META_API_KEY, base: baseUrl(env), frames: checked.frames,
     });
     // The cross-check total comes from code (bucket-cycle unwrap of the
-    // coarse facings), not from the model's own total_degrees.
+    // coarse facings), not from the model's own total_degrees. When the
+    // progression shows a completed turn, the completed-cycle rule snaps
+    // to the trick total (spins land in multiples of 180°).
     const bucket = bucketCycleTotal(pose.frames);
+    const snap = snapCycleTotal(bucket);
     const measured = body && body.measured && typeof body.measured === "object" ? body.measured : {};
     const measuredTotal = Number(measured.total_degrees);
-    const verification = bucket.error ? null : {
-      trick: pose.trick,
-      direction: pose.direction,
-      total_degrees: Math.abs(bucket.total_degrees),
-      confidence: pose.confidence,
-    };
+    const measuredDirection = typeof measured.direction === "string" ? measured.direction : "";
+    let agreement;
+    if (snap) {
+      agreement = cycleAgreement(measuredTotal, measuredDirection, snap.total_degrees, bucket.direction);
+    } else if (!bucket.error) {
+      agreement = agreementFor(measuredTotal, {
+        trick: pose.trick,
+        direction: pose.direction,
+        total_degrees: Math.abs(bucket.total_degrees),
+        confidence: pose.confidence,
+      });
+    } else {
+      agreement = "UNVERIFIED";
+    }
     return json({
-      ok: true, pose, bucket,
-      agreement: verification ? agreementFor(measuredTotal, verification) : "UNVERIFIED",
+      ok: true, pose, bucket, snap, agreement,
       model_error: false, error: "",
     });
   } catch (err) {
     const isMeta = err instanceof MetaError;
     return json({
-      ok: true, pose: null, bucket: null, agreement: "UNVERIFIED", model_error: true,
+      ok: true, pose: null, bucket: null, snap: null, agreement: "UNVERIFIED", model_error: true,
       error: err instanceof Error ? err.message : String(err),
       status: isMeta ? err.status : 0,
     });

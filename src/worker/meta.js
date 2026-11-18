@@ -411,51 +411,51 @@ export function bucketCycleTotal(entries) {
 }
 
 /**
- * Judge a spin from ONE contact sheet: the rider cropped and enlarged in
- * every window frame, in time order, each tile labeled with its time.
- * This is the cross-check for the yaw-sequence fit, and it exists because
- * per-frame absolute yaw on full frames failed on the real 360 clip
- * (Nov 18: rider ~60px tall, yaw fit said 198°, verifier saw no spin).
- * Coarse 4-way facing on enlarged crops is a much easier judgement than
- * an exact angle on a tiny rider, and the sheet lets the model compare
- * poses across the whole trick instead of rating frames in isolation.
+ * Judge a spin from the rider crops as SEPARATE images: coarse 4-way
+ * facing per crop, in time order. This is the cross-check for the
+ * yaw-sequence fit. Coarse facing on enlarged crops is a much easier
+ * judgement than an exact angle, and separate images keep the model
+ * attending to each crop fully — the earlier contact-sheet format
+ * failed on the real 360 clip (Nov 18: the sheet call read "front" for
+ * 6 straight tiles and totaled 90°, while the same crops as separate
+ * images produced a sensible progression in the yaw call).
  * The facing progression is turned into a rotation total in code
  * (bucket-cycle unwrap), never trusted from the model's own total alone.
  * Returns { frames: [{index,time,facing,confidence,evidence}], trick,
  * direction, total_degrees, confidence, reason }.
- * Throws MetaError when the reply does not cover every tile.
+ * Throws MetaError when the reply does not cover every frame.
  */
-export async function poseFromSheet({ apiKey, base, sheet, times, timeoutMs = 90000 }) {
-  const tileList = times.map((t, i) => `Tile ${i + 1} (t=${t.toFixed(2)}s)`).join(", ");
+export async function poseFromCrops({ apiKey, base, frames, timeoutMs = 90000 }) {
+  const frameList = frames.map((f, i) => `Frame ${i + 1} (t=${f.time.toFixed(2)}s)`).join(", ");
   const prompt = [
-    "You are judging ONE snowboard aerial trick from a contact sheet. The sheet shows the SAME rider cropped and enlarged in each frame, in time order, left to right, top to bottom. Each tile is labeled with its time.",
-    `Tiles: ${tileList}.`,
-    "For EACH tile, judge the rider's chest-facing bucket from what is VISIBLE in that tile only:",
+    "You are judging ONE snowboard aerial trick from cropped, enlarged frames in time order. The crops show the SAME rider throughout; the rider may turn through all four facings during the trick.",
+    `Frames: ${frameList}.`,
+    "For EACH frame, judge the rider's chest-facing bucket from what is VISIBLE in that frame only:",
     "- toward_camera: chest/face toward the camera (goggles or face visible, chest facing you).",
     "- facing_right: chest facing the right side of the frame (left profile).",
     "- away_from_camera: back to the camera (back of jacket/helmet, no face).",
     "- facing_left: chest facing the left side of the frame (right profile).",
-    "- unknown: the facing cannot be told from this tile.",
-    "Judge from visible features: goggles/face direction, chest vs back of the jacket, shoulder line, and board angle. If a tile is ambiguous, say unknown with low confidence — never guess a facing to make a smooth progression. Do NOT assume a spin is happening; report only what each tile shows.",
-    "Then estimate the overall trick: trick name (e.g. Frontside 360, Backside 540, or Unknown), direction as seen by the camera (clockwise/counter-clockwise/unknown), total_degrees (how far the rider rotated from the first tile to the last, from the facing progression), overall confidence, and one reason sentence citing what you see across the sheet.",
-    "Reply with JSON ONLY, no other text, one entry per tile in the same order:",
-    '{"frames":[{"index":1,"facing":"away_from_camera","confidence":0.9,"evidence":"back of jacket, no face visible"}],"trick":"Frontside 360","direction":"clockwise","total_degrees":360,"confidence":0.8,"reason":"Facing cycles back, left, front, right, back across the sheet."}',
+    "- unknown: the facing cannot be told from this frame.",
+    "Judge from visible features: goggles/face direction, chest vs back of the jacket, shoulder line, and board angle. Judge each frame on its own — do not carry a facing forward because the previous frame had it. If a frame is ambiguous, say unknown with low confidence — never guess a facing to make a smooth progression. Do NOT assume a spin is happening; report only what each frame shows.",
+    "Then estimate the overall trick: trick name (e.g. Frontside 360, Backside 540, or Unknown), direction as seen by the camera (clockwise/counter-clockwise/unknown), total_degrees (how far the rider rotated from the first frame to the last, from the facing progression), overall confidence, and one reason sentence citing what you see across the frames.",
+    "Reply with JSON ONLY, no other text, one entry per frame in the same order:",
+    '{"frames":[{"index":1,"facing":"away_from_camera","confidence":0.9,"evidence":"back of jacket, no face visible"}],"trick":"Frontside 360","direction":"clockwise","total_degrees":360,"confidence":0.8,"reason":"Facing cycles back, left, front, right, back across the frames."}',
   ].join("\n");
   const parsed = await sparkJson({
-    apiKey, base, prompt, images: [sheet], maxImages: 1, timeoutMs,
+    apiKey, base, prompt, images: frames.map((f) => f.image), maxImages: 12, timeoutMs,
   });
   const list = Array.isArray(parsed.frames) ? parsed.frames : null;
-  if (!list || list.length !== times.length) {
+  if (!list || list.length !== frames.length) {
     throw new MetaError(
-      `Spark pose sheet covered ${list ? list.length : 0} of ${times.length} tiles.`,
+      `Spark pose judgement covered ${list ? list.length : 0} of ${frames.length} frames.`,
       { status: 200, retryable: false },
     );
   }
   const total = Number(parsed.total_degrees);
   return {
     frames: list.map((entry, i) => ({
-      index: i,
-      time: times[i],
+      index: frames[i].index,
+      time: frames[i].time,
       facing: POSE_FACINGS.includes(entry && entry.facing) ? entry.facing : "unknown",
       confidence: clamp01(entry && entry.confidence),
       evidence: typeof (entry && entry.evidence) === "string" ? entry.evidence : "",
@@ -466,6 +466,53 @@ export async function poseFromSheet({ apiKey, base, sheet, times, timeoutMs = 90
     confidence: clamp01(parsed.confidence),
     reason: typeof parsed.reason === "string" ? parsed.reason : "",
   };
+}
+
+/**
+ * Completed-cycle rule: turn a bucket-cycle result into a trick total
+ * when the evidence shows a full turn. Spins land in discrete facing
+ * states (multiples of 180°), while per-frame yaw under-reads the spin
+ * (Nov 18: a real 360 fit to 266°). A monotonic progression that visits
+ * all four facings with a net of at least 225° cannot be a sub-180° turn
+ * (at most 3 buckets) — it completed at least one full turn — so the
+ * total snaps up to the next multiple of 180°. The snap fires ONLY on
+ * that strong evidence; anything weaker returns null and the caller
+ * falls back to the bucket total / fit comparison.
+ * Returns { total_degrees (signed), rule } or null.
+ * Known limit, documented: a spin that lands 90° short of a full turn
+ * (rider sideways) can read as the full turn; the run notes always show
+ * the bucket progression so a coach can see exactly what was judged.
+ */
+export function snapCycleTotal(bucket) {
+  if (!bucket || bucket.error) return null;
+  const net = Number(bucket.total_degrees);
+  if (!Number.isFinite(net) || Math.abs(net) < 225) return null;
+  if (!Array.isArray(bucket.sequence) || bucket.sequence.length < 5) return null;
+  const distinct = new Set(bucket.sequence);
+  if (distinct.size < 4) return null;
+  const snapped = 180 * Math.ceil(Math.abs(net) / 180);
+  return {
+    total_degrees: net < 0 ? -snapped : snapped,
+    rule: `monotonic ${bucket.sequence.length}-bucket progression visiting all four facings, net ${Math.round(net)}° → completed-cycle total ${snapped}°`,
+  };
+}
+
+/**
+ * Verdict for the completed-cycle path. LOCKED when the yaw fit points
+ * the same way as the cycle and lands in the same ballpark (within 180°
+ * of the snapped total — the fit is a known under-reader, so the gate
+ * catches gross disagreement, not fine error). Anything else is
+ * DISPUTED: the two measurements genuinely disagree.
+ */
+export function cycleAgreement(fitTotal, fitDirection, snapTotal, bucketDirection) {
+  if (!Number.isFinite(fitTotal) || !Number.isFinite(snapTotal)) return "DISPUTED";
+  const fitCW = typeof fitDirection === "string" && fitDirection.startsWith("clockwise");
+  const fitCCW = typeof fitDirection === "string" && fitDirection.startsWith("counter");
+  const bucketCW = typeof bucketDirection === "string" && bucketDirection.startsWith("clockwise");
+  const bucketCCW = typeof bucketDirection === "string" && bucketDirection.startsWith("counter");
+  if ((fitCW && bucketCCW) || (fitCCW && bucketCW)) return "DISPUTED";
+  if (Math.abs(Math.abs(fitTotal) - Math.abs(snapTotal)) > 180) return "DISPUTED";
+  return "LOCKED";
 }
 
 /**

@@ -301,7 +301,7 @@
   </section>
 
   <footer>
-    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the total, peak, and average rates; and a separate pose-sheet call judges coarse facing (front / right / back / left) on one contact sheet of the same crops, turned into a rotation total in code. <b>LOCKED</b> means the curve fit and the pose-sheet total agree within 45° with a confident, named trick. <b>CLOSE</b> within 120°. <b>DISPUTED</b> otherwise. <b>UNVERIFIED</b> means the two checks could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
+    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code. When the facing progression shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180° and per-frame yaw under-reads the spin; the run notes always show the facing progression and say when the rule applied. <b>LOCKED</b> means the two checks confirm the same trick: either the curve fit and the facing-progression total agree within 45° with a confident, named trick, or the completed-cycle rule fired with the fit pointing the same way and in the same ballpark. <b>CLOSE</b> within 120° on the fit comparison. <b>DISPUTED</b> otherwise. <b>UNVERIFIED</b> means the two checks could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
     <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs.
   </footer>
 </div>
@@ -985,45 +985,6 @@ function cropRiderImage(dataUrl, box) {
   });
 }
 
-/**
- * Compose rider crops into one labeled contact sheet (4 columns, tiles
- * 288px + time label bar), returned as a JPEG data URL. The pose call
- * judges the whole trick from this one image. Tiles stay small on purpose:
- * a 1440px-wide sheet timed out against the model API (Nov 18), while
- * 288px tiles still show the rider ~4x larger than the full frame.
- */
-async function composeContactSheet(crops) {
-  const TILE = 288, LABEL = 36, COLS = 4;
-  const rows = Math.max(1, Math.ceil(crops.length / COLS));
-  const sheet = document.createElement("canvas");
-  sheet.width = COLS * TILE;
-  sheet.height = rows * (TILE + LABEL);
-  const ctx = sheet.getContext("2d");
-  ctx.fillStyle = "#0a0a0c";
-  ctx.fillRect(0, 0, sheet.width, sheet.height);
-  for (let i = 0; i < crops.length; i++) {
-    const col = i % COLS, row = Math.floor(i / COLS);
-    const x0 = col * TILE, y0 = row * (TILE + LABEL);
-    const img = await new Promise((resolve) => {
-      const im = new Image();
-      im.onload = () => resolve(im);
-      im.onerror = () => resolve(null);
-      im.src = crops[i].image;
-    });
-    if (img) {
-      const scale = Math.min(TILE / img.width, TILE / img.height);
-      const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
-      ctx.drawImage(img, x0 + Math.round((TILE - w) / 2), y0 + Math.round((TILE - h) / 2), w, h);
-    }
-    ctx.fillStyle = "#141416";
-    ctx.fillRect(x0, y0 + TILE, TILE, LABEL);
-    ctx.fillStyle = "#ffffff";
-    ctx.font = "bold 19px system-ui, sans-serif";
-    ctx.textBaseline = "middle";
-    ctx.fillText(`Tile ${i + 1} · ${crops[i].time.toFixed(2)}s`, x0 + 12, y0 + TILE + LABEL / 2);
-  }
-  return sheet.toDataURL("image/jpeg", 0.75);
-}
 
 async function extractFramesInRange(video, start, end, fps, maxFrames, signal, onProgress, targetWidth) {
   const duration = video.duration;
@@ -1192,7 +1153,7 @@ async function runAutoScan() {
     const fitted = fitSpinCurve(points, windowInfo.window.takeoffTime, windowInfo.window.landingTime);
     if (fitted.error) throw new Error(fitted.error);
     const stats = fitted.stats;
-    stats.method = "rider-crop yaw + pose-sheet cross-check";
+    stats.method = "rider-crop yaw + facing cross-check";
     const meanConf = points.reduce((a, p) => a + (p.confidence || 0), 0) / Math.max(1, points.length);
     run.notes.push(`Rotation from ${fitted.kept.length} yaw estimate(s) on enlarged rider crops (mean confidence ${Math.round(meanConf * 100)}%) fit to a spin curve${fitted.dropped ? `; ${fitted.dropped} outlier(s) dropped` : ""}.`);
     const sparkOverall = Number(sdata.sequence.total_degrees);
@@ -1209,19 +1170,20 @@ async function runAutoScan() {
     run.frames = storedFrames;
     run.window = windowInfo.window;
 
-    // Pose-sheet cross-check: one contact sheet of the enlarged crops,
-    // judged as coarse 4-way facing per tile. The Worker turns the facing
-    // progression into a rotation total in code (bucket-cycle unwrap) and
-    // compares it with the yaw-curve fit. No measured numbers reach the
-    // pose prompt, so the check stays independent.
-    setClipProgress("Muse Spark is judging the pose sheet…", 0, 0, startedAt);
+    // Facing cross-check: the same enlarged crops as separate images,
+    // judged as coarse 4-way facing per frame. The Worker turns the
+    // facing progression into a rotation total in code (bucket-cycle
+    // unwrap) and, when the progression shows a completed turn, applies
+    // the completed-cycle rule (spins land in multiples of 180°). No
+    // measured numbers reach the pose prompt, so the check stays
+    // independent. (An earlier contact-sheet format failed: it read
+    // "front" for 6 straight tiles on the real 360 clip.)
+    setClipProgress("Muse Spark is judging the facing…", 0, 0, startedAt);
     try {
-      const sheet = await composeContactSheet(crops);
       const pres = await fetch("/api/pose", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sheet,
-          times: crops.map((c) => c.time),
+          frames: crops.map((c) => ({ index: c.index, time: c.time, image: c.image })),
           measured: { total_degrees: Math.round(stats.total_degrees), airtime_s: Number(stats.airtime_s.toFixed(2)), direction: stats.direction },
         }),
         signal,
@@ -1230,33 +1192,56 @@ async function runAutoScan() {
       if (pdata.pose) {
         const pose = pdata.pose;
         const bucket = pdata.bucket || {};
+        const snap = pdata.snap || null;
         const facingWords = { toward_camera: "front", facing_right: "right", away_from_camera: "back", facing_left: "left", unknown: "?" };
         if (!bucket.error && Array.isArray(bucket.sequence)) {
-          run.notes.push(`Pose sheet facing: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident tiles, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
-          run.verification = {
-            trick: pose.trick, direction: pose.direction,
-            total_degrees: Math.abs(bucket.total_degrees),
-            confidence: pose.confidence,
-            reason: (pose.reason || "") + ` Pose-sheet total ${Math.round(Math.abs(bucket.total_degrees))}° from the facing progression; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.`,
-            agreement: pdata.agreement || "UNVERIFIED",
-          };
+          run.notes.push(`Facing progression: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident frames, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
+          if (snap && Number.isFinite(Number(snap.total_degrees))) {
+            // Completed-cycle total replaces the fitted total: per-frame
+            // yaw is a known under-reader, and the facing cycle shows a
+            // full turn. Rates scale to the cycle total; the curve keeps
+            // its measured shape. All of it is stated in the notes.
+            const fitTotal = stats.total_degrees;
+            const cycleTotal = Math.abs(Number(snap.total_degrees));
+            const scale = fitTotal > 0 ? cycleTotal / fitTotal : 1;
+            stats.total_degrees = cycleTotal;
+            stats.peak_rate = stats.peak_rate * scale;
+            stats.avg_rate = stats.airtime_s > 0 ? cycleTotal / stats.airtime_s : 0;
+            stats.method = "completed facing cycle + yaw curve";
+            run.notes.push(`Total from the completed facing cycle: ${snap.rule || "facing progression shows a completed turn"}. The per-frame yaw curve read ${Math.round(fitTotal)}° and its rates were scaled to the cycle total; the curve shape is as measured.`);
+            run.verification = {
+              trick: pose.trick, direction: pose.direction,
+              total_degrees: cycleTotal,
+              confidence: pose.confidence,
+              reason: (pose.reason || "") + ` Completed-cycle total ${Math.round(cycleTotal)}° from the facing progression; yaw curve fit ${Math.round(fitTotal)}°; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.`,
+              agreement: pdata.agreement || "UNVERIFIED",
+            };
+          } else {
+            run.verification = {
+              trick: pose.trick, direction: pose.direction,
+              total_degrees: Math.abs(bucket.total_degrees),
+              confidence: pose.confidence,
+              reason: (pose.reason || "") + ` Facing-progression total ${Math.round(Math.abs(bucket.total_degrees))}° from the coarse facings; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.`,
+              agreement: pdata.agreement || "UNVERIFIED",
+            };
+          }
         } else {
           run.verification = {
             trick: pose.trick || "Unknown", direction: pose.direction || "unknown",
             total_degrees: Number(pose.total_degrees) || 0,
             confidence: pose.confidence || 0,
-            reason: (pose.reason || "") + " Pose-sheet facing progression was inconclusive: " + (bucket.error || "unknown bucket error") + ".",
+            reason: (pose.reason || "") + " Facing progression was inconclusive: " + (bucket.error || "unknown bucket error") + ".",
             agreement: "UNVERIFIED",
           };
-          run.notes.push("Pose-sheet cross-check inconclusive: " + (bucket.error || "unknown bucket error") + ". Measured stats above are still real; the trick call stays unverified.");
+          run.notes.push("Facing cross-check inconclusive: " + (bucket.error || "unknown bucket error") + ". Measured stats above are still real; the trick call stays unverified.");
         }
       } else {
         run.verification = null;
-        run.notes.push("Pose-sheet check did not return a call: " + (pdata.error || "unknown pose error") + ". Measured stats above are still real; the trick call is honestly unverified.");
+        run.notes.push("Facing cross-check did not return a call: " + (pdata.error || "unknown pose error") + ". Measured stats above are still real; the trick call is honestly unverified.");
       }
     } catch (perr) {
       run.verification = null;
-      run.notes.push("Pose-sheet check failed: " + (perr.message || String(perr)) + ". Measured stats above are still real; the trick call is honestly unverified.");
+      run.notes.push("Facing cross-check failed: " + (perr.message || String(perr)) + ". Measured stats above are still real; the trick call is honestly unverified.");
     }
 
     run.status = "complete";
