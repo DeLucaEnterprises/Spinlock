@@ -45,7 +45,9 @@ SAM gives a **measurable** first pass: a box per frame confirming the board is a
 
 ```
 public/index.html          Single-page X Games broadcast UI (no build step, no CDN deps)
-public/spinlock-logo.png   Brand mark (exact approved file)
+public/spinlock-logo.png   Brand artwork (Mark-supplied, Nov 18: rider + SPINLOCK wordmark)
+public/spinlock-header.jpg Header banner crop of the artwork (wordmark band, corners cleaned)
+public/favicon.png         Square rider crop for the browser tab icon
 src/worker/index.js        Worker entry: routing, batched SAM endpoints, static fallback
 src/worker/meta.js         Meta Model API client: SAM parsing, Spark verify, health check
 wrangler.toml              Worker + static assets config
@@ -200,7 +202,9 @@ package.json               Scripts + wrangler devDependency (no runtime deps)
 .dev.vars.example          Local-dev secret template (copy to .dev.vars; gitignored)
 .gitignore                 node_modules, .wrangler, .dev.vars
 public/index.html          Whole frontend: X Games UI, frame extraction, geometry, live mode, run sheet
-public/spinlock-logo.png   Brand mark (exact approved file, 1600×1600)
+public/spinlock-logo.png   Brand artwork (Mark-supplied Nov 18, 1206×804)
+public/spinlock-header.jpg Header banner crop (804×320, wordmark band)
+public/favicon.png         Browser tab icon (128×128 rider crop)
 src/worker/index.js        Routing + batched API endpoints + assets fallback
 src/worker/meta.js         Meta API client, SAM box parsing, Spark verify, health check
 ```
