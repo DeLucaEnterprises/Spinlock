@@ -498,6 +498,21 @@ export function snapCycleTotal(bucket) {
 }
 
 /**
+ * True when two spin-direction strings agree. Unknown direction on
+ * either side passes — it is absence of evidence, not contradiction.
+ * Direction strings come from the model ("clockwise (as seen)",
+ * "counter-clockwise (as seen)", "unknown") or the bucket unwrap.
+ */
+export function sameSpinDirection(a, b) {
+  const aCW = typeof a === "string" && a.startsWith("clockwise");
+  const aCCW = typeof a === "string" && a.startsWith("counter");
+  const bCW = typeof b === "string" && b.startsWith("clockwise");
+  const bCCW = typeof b === "string" && b.startsWith("counter");
+  if ((aCW && bCCW) || (aCCW && bCW)) return false;
+  return true;
+}
+
+/**
  * Verdict for the completed-cycle path. LOCKED when the yaw fit points
  * the same way as the cycle and lands in the same ballpark (within 180°
  * of the snapped total — the fit is a known under-reader, so the gate
@@ -506,13 +521,40 @@ export function snapCycleTotal(bucket) {
  */
 export function cycleAgreement(fitTotal, fitDirection, snapTotal, bucketDirection) {
   if (!Number.isFinite(fitTotal) || !Number.isFinite(snapTotal)) return "DISPUTED";
-  const fitCW = typeof fitDirection === "string" && fitDirection.startsWith("clockwise");
-  const fitCCW = typeof fitDirection === "string" && fitDirection.startsWith("counter");
-  const bucketCW = typeof bucketDirection === "string" && bucketDirection.startsWith("clockwise");
-  const bucketCCW = typeof bucketDirection === "string" && bucketDirection.startsWith("counter");
-  if ((fitCW && bucketCCW) || (fitCCW && bucketCW)) return "DISPUTED";
+  if (!sameSpinDirection(fitDirection, bucketDirection)) return "DISPUTED";
   if (Math.abs(Math.abs(fitTotal) - Math.abs(snapTotal)) > 180) return "DISPUTED";
   return "LOCKED";
+}
+
+/**
+ * Verdict for the facing-progression path — the primary measurement.
+ * The coarse facing progression is the total; the yaw-curve fit is a
+ * fragile corroborator, not an equal partner (Nov 20: on a real 180 the
+ * fit read 485° while the facing progression, Spark's own total, and
+ * the start/end facings all said 180° — the unwrap amplifies per-frame
+ * facing errors into hundreds of degrees).
+ * - Bucket inconclusive (error, fewer than 5 kept) → UNVERIFIED.
+ * - Snap fired → the completed-cycle verdict (cycleAgreement).
+ * - Opposite directions → DISPUTED.
+ * - Fit within 120° of the bucket total, same direction, pose
+ *   confidence ≥ 0.3 → LOCKED.
+ * - Fit within one full turn (360°) of the bucket total → CLOSE: the
+ *   bucket total stands, the fit is inside its demonstrated error band.
+ * - Fit further than a full turn away → DISPUTED.
+ * - No usable fit at all → CLOSE (the bucket progression is the
+ *   measurement; the fit simply did not corroborate it).
+ */
+export function bucketVerdict({ fitTotal, fitDirection, bucket, snap, poseConfidence }) {
+  if (!bucket || bucket.error || !Array.isArray(bucket.sequence) || bucket.sequence.length < 5) return "UNVERIFIED";
+  if (snap) return cycleAgreement(fitTotal, fitDirection, snap.total_degrees, bucket.direction);
+  const net = Math.abs(Number(bucket.total_degrees));
+  if (!Number.isFinite(net)) return "UNVERIFIED";
+  if (!sameSpinDirection(fitDirection, bucket.direction)) return "DISPUTED";
+  if (!Number.isFinite(fitTotal)) return "CLOSE";
+  const diff = Math.abs(Math.abs(fitTotal) - net);
+  if (diff <= 120 && poseConfidence >= 0.3) return "LOCKED";
+  if (diff <= 360) return "CLOSE";
+  return "DISPUTED";
 }
 
 /**

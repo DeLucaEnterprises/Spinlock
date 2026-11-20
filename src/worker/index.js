@@ -25,9 +25,9 @@ import {
   MetaError,
   agreementFor,
   bucketCycleTotal,
+  bucketVerdict,
   checkHealth,
   classifyAirtime,
-  cycleAgreement,
   estimateYawSequence,
   poseFromCrops,
   segmentFrame,
@@ -273,27 +273,30 @@ async function handlePose(request, env) {
     // The cross-check total comes from code (bucket-cycle unwrap of the
     // coarse facings), not from the model's own total_degrees. When the
     // progression shows a completed turn, the completed-cycle rule snaps
-    // to the trick total (spins land in multiples of 180°).
+    // to the trick total (spins land in multiples of 180°). The facing
+    // progression is the PRIMARY total — the yaw-curve fit is a fragile
+    // corroborator (Nov 20: on a real 180 the fit read 485° while the
+    // facing progression and Spark's own total both said 180°).
+    // `measured` is optional: the frontend fires the pose call in
+    // parallel with the yaw call, so the fit may not exist yet. Without
+    // it the verdict comes back null and the caller computes it from
+    // the same rules (see bucketVerdict / the page's verdictForBucket).
     const bucket = bucketCycleTotal(pose.frames);
     const snap = snapCycleTotal(bucket);
-    const measured = body && body.measured && typeof body.measured === "object" ? body.measured : {};
-    const measuredTotal = Number(measured.total_degrees);
-    const measuredDirection = typeof measured.direction === "string" ? measured.direction : "";
-    let agreement;
-    if (snap) {
-      agreement = cycleAgreement(measuredTotal, measuredDirection, snap.total_degrees, bucket.direction);
-    } else if (!bucket.error) {
-      agreement = agreementFor(measuredTotal, {
-        trick: pose.trick,
-        direction: pose.direction,
-        total_degrees: Math.abs(bucket.total_degrees),
-        confidence: pose.confidence,
+    const primary_total = snap
+      ? Math.abs(snap.total_degrees)
+      : (!bucket.error && Number.isFinite(Number(bucket.total_degrees)) ? Math.abs(Number(bucket.total_degrees)) : null);
+    const measured = body && body.measured && typeof body.measured === "object" ? body.measured : null;
+    let agreement = null;
+    if (measured) {
+      agreement = bucketVerdict({
+        fitTotal: Number(measured.total_degrees),
+        fitDirection: typeof measured.direction === "string" ? measured.direction : "",
+        bucket, snap, poseConfidence: pose.confidence,
       });
-    } else {
-      agreement = "UNVERIFIED";
     }
     return json({
-      ok: true, pose, bucket, snap, agreement,
+      ok: true, pose, bucket, snap, primary_total, agreement,
       model_error: false, error: "",
     });
   } catch (err) {

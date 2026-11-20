@@ -301,7 +301,7 @@
   </section>
 
   <footer>
-    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code. When the facing progression shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180° and per-frame yaw under-reads the spin; the run notes always show the facing progression and say when the rule applied. <b>LOCKED</b> means the two checks confirm the same trick: either the curve fit and the facing-progression total agree within 45° with a confident, named trick, or the completed-cycle rule fired with the fit pointing the same way and in the same ballpark. <b>CLOSE</b> within 120° on the fit comparison. <b>DISPUTED</b> otherwise. <b>UNVERIFIED</b> means the two checks could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
+    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code. The facing progression is the total: when it shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180°. The per-frame yaw curve is a fragile corroborator (on one real 180 it read 485° while the facing progression said 180°), so its rates and curve are scaled to the facing total, and the run notes always show the facing progression and the fit value. <b>LOCKED</b> means the facing progression and the curve fit confirm the same trick (within 120°, same direction, confident), or the completed-cycle rule fired with the fit in the same ballpark. <b>CLOSE</b> means the facing total stands but the fit disagrees beyond 120° (up to a full turn). <b>DISPUTED</b> means opposite directions or disagreement over a full turn. <b>UNVERIFIED</b> means the facing progression could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
     <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs.
   </footer>
 </div>
@@ -802,6 +802,44 @@ function fitSpinCurve(points, takeoffTime, landingTime) {
 }
 
 /**
+ * Verdict for the facing-progression path — the mirror of the Worker's
+ * bucketVerdict in meta.js (same bands; keep the two in sync). The
+ * coarse facing progression is the primary total; the yaw-curve fit is
+ * a fragile corroborator, not an equal partner: on a real 180 the fit
+ * read 485° while the facing progression, Spark's own total, and the
+ * start/end facings all said 180°. Bands: bucket inconclusive →
+ * UNVERIFIED; snap fired → completed-cycle verdict (same direction and
+ * within 180° of the snapped total → LOCKED, else DISPUTED); opposite
+ * directions → DISPUTED; fit within 120° and same direction with pose
+ * confidence ≥ 0.3 → LOCKED; fit within one full turn (360°) → CLOSE;
+ * further than a full turn → DISPUTED; no usable fit → CLOSE.
+ */
+function verdictForBucket({ fitTotal, fitDirection, bucket, snap, poseConfidence }) {
+  if (!bucket || bucket.error || !Array.isArray(bucket.sequence) || bucket.sequence.length < 5) return "UNVERIFIED";
+  const dirOk = (a, b) => {
+    const aCW = typeof a === "string" && a.startsWith("clockwise");
+    const aCCW = typeof a === "string" && a.startsWith("counter");
+    const bCW = typeof b === "string" && b.startsWith("clockwise");
+    const bCCW = typeof b === "string" && b.startsWith("counter");
+    return !((aCW && bCCW) || (aCCW && bCW));
+  };
+  if (snap) {
+    if (!Number.isFinite(fitTotal) || !Number.isFinite(Number(snap.total_degrees))) return "DISPUTED";
+    if (!dirOk(fitDirection, bucket.direction)) return "DISPUTED";
+    if (Math.abs(Math.abs(fitTotal) - Math.abs(Number(snap.total_degrees))) > 180) return "DISPUTED";
+    return "LOCKED";
+  }
+  const net = Math.abs(Number(bucket.total_degrees));
+  if (!Number.isFinite(net)) return "UNVERIFIED";
+  if (!dirOk(fitDirection, bucket.direction)) return "DISPUTED";
+  if (!Number.isFinite(fitTotal)) return "CLOSE";
+  const diff = Math.abs(Math.abs(fitTotal) - net);
+  if (diff <= 120 && poseConfidence >= 0.3) return "LOCKED";
+  if (diff <= 360) return "CLOSE";
+  return "DISPUTED";
+}
+
+/**
  * Square crop rect (pixels) around a normalized SAM box, expanded by
  * `margin` (fraction of the box size) and clamped inside the image.
  * Squaring keeps the rider + board together and gives Spark a uniform,
@@ -1096,18 +1134,22 @@ async function runAutoScan() {
     setClipProgress("Extracting frames in the trick window…", 0, 0, startedAt);
     // Window frames at up to 960 wide: SAM boxes and rider crops need the
     // resolution — at 480 the rider is ~60px tall and facing is unreadable.
-    windowFrames = await extractFramesInRange(clipVideo, windowInfo.window.start, windowInfo.window.end, fps, 12, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt), 960);
+    windowFrames = await extractFramesInRange(clipVideo, windowInfo.window.start, windowInfo.window.end, fps, 10, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt), 960);
 
-    setClipProgress("SAM 3.1 is tracking the board…", 0, windowFrames.length, startedAt);
-    const analyzed = await samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is tracking the board…", d, t, startedAt));
+    // Board lock and rider lock are independent SAM passes over the same
+    // frames, so they run in parallel — two sequential passes were a
+    // third of the old run time.
+    setClipProgress("SAM 3.1 is locking onto the board and rider…", 0, windowFrames.length, startedAt);
+    const [analyzed, riderScanned] = await Promise.all([
+      samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is locking onto the board and rider…", d, t, startedAt)),
+      samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is locking onto the board and rider…", d, t, startedAt), "snowboarder"),
+    ]);
     if (analyzed.sam_errors > 0) run.notes.push(`SAM model errors on ${analyzed.sam_errors} window frame(s) — counted separately from no-board frames.`);
     const byIndex = new Map(analyzed.results.map((r) => [r.index, r]));
 
     // Rider boxes for crop-to-rider measurement: the rider (dark jacket,
     // red pants) is a far bigger, higher-contrast SAM target than the
     // thin board, and enlarged crops are what make facing readable.
-    setClipProgress("SAM 3.1 is locking onto the rider…", 0, windowFrames.length, startedAt);
-    const riderScanned = await samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is locking onto the rider…", d, t, startedAt), "snowboarder");
     if (riderScanned.sam_errors > 0) run.notes.push(`SAM model errors on ${riderScanned.sam_errors} rider-lock frame(s).`);
     const riderByIndex = new Map(riderScanned.results.map((r) => [r.index, r]));
     const riderFound = riderScanned.results.filter((r) => r.found).length;
@@ -1123,11 +1165,20 @@ async function runAutoScan() {
     }
     if (cropFallbacks > 0) run.notes.push(`${cropFallbacks} frame(s) had no rider box, so those measurements used the full frame instead of a crop.`);
 
-    // Rotation from the yaw sequence on CROPS: Spark estimates the rider's
-    // facing in each enlarged crop; the estimates are unwrapped and fit
-    // to a spin curve. (Board-axis pixel geometry cannot measure a spin:
-    // it unwraps to ~0° on a real 360. It is no longer used for results.)
-    setClipProgress("Spark is estimating the spin…", 0, 0, startedAt);
+    // Rotation from the yaw sequence on CROPS, and the facing cross-check
+    // on the same crops — fired in parallel, because the two Spark calls
+    // are independent and each takes 30–90s. The pose call carries no
+    // measured numbers (the fit does not exist yet), so its verdict is
+    // computed here once the fit lands (verdictForBucket, the mirror of
+    // the Worker's bucketVerdict). (Board-axis pixel geometry cannot
+    // measure a spin: it unwraps to ~0° on a real 360. It is no longer
+    // used for results.)
+    setClipProgress("Spark is estimating the spin and judging the facing…", 0, 0, startedAt);
+    const posePromise = fetch("/api/pose", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ frames: crops.map((c) => ({ index: c.index, time: c.time, image: c.image })) }),
+      signal,
+    }).then((r) => r.json().catch(() => ({}))).catch((e) => ({ __poseFailed: true, __poseError: e && e.message ? e.message : String(e) }));
     const sres = await fetch("/api/sequence", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ frames: crops.map((f) => ({ index: f.index, time: f.time, image: f.image })) }),
@@ -1170,61 +1221,58 @@ async function runAutoScan() {
     run.frames = storedFrames;
     run.window = windowInfo.window;
 
-    // Facing cross-check: the same enlarged crops as separate images,
-    // judged as coarse 4-way facing per frame. The Worker turns the
-    // facing progression into a rotation total in code (bucket-cycle
-    // unwrap) and, when the progression shows a completed turn, applies
-    // the completed-cycle rule (spins land in multiples of 180°). No
-    // measured numbers reach the pose prompt, so the check stays
-    // independent. (An earlier contact-sheet format failed: it read
-    // "front" for 6 straight tiles on the real 360 clip.)
+    // Facing cross-check (fired in parallel with the yaw call above):
+    // the same enlarged crops as separate images, judged as coarse
+    // 4-way facing per frame. The Worker turns the facing progression
+    // into a rotation total in code (bucket-cycle unwrap) and, when the
+    // progression shows a completed turn, applies the completed-cycle
+    // rule (spins land in multiples of 180°).
+    //
+    // The facing progression is the PRIMARY total. The yaw-curve fit is
+    // a fragile corroborator: on a real 180 it read 485° while the
+    // facing progression and Spark's own total both said 180°, because
+    // the unwrap amplifies per-frame facing errors. So when the
+    // progression is clean, the headline total, rates, and curve scale
+    // to the facing total — and the notes say so, with the fit value.
+    // (An earlier contact-sheet format failed: it read "front" for 6
+    // straight tiles on the real 360 clip.)
     setClipProgress("Muse Spark is judging the facing…", 0, 0, startedAt);
     try {
-      const pres = await fetch("/api/pose", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          frames: crops.map((c) => ({ index: c.index, time: c.time, image: c.image })),
-          measured: { total_degrees: Math.round(stats.total_degrees), airtime_s: Number(stats.airtime_s.toFixed(2)), direction: stats.direction },
-        }),
-        signal,
-      });
-      const pdata = await pres.json().catch(() => ({}));
+      const pdata = await posePromise;
+      if (pdata.__poseFailed) throw new Error(pdata.__poseError || "pose request failed");
       if (pdata.pose) {
         const pose = pdata.pose;
         const bucket = pdata.bucket || {};
         const snap = pdata.snap || null;
         const facingWords = { toward_camera: "front", facing_right: "right", away_from_camera: "back", facing_left: "left", unknown: "?" };
-        if (!bucket.error && Array.isArray(bucket.sequence)) {
+        if (!bucket.error && Array.isArray(bucket.sequence) && pdata.primary_total != null) {
+          const primaryTotal = Math.abs(Number(pdata.primary_total));
+          const fitTotal = stats.total_degrees;
           run.notes.push(`Facing progression: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident frames, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
           if (snap && Number.isFinite(Number(snap.total_degrees))) {
-            // Completed-cycle total replaces the fitted total: per-frame
-            // yaw is a known under-reader, and the facing cycle shows a
-            // full turn. Rates scale to the cycle total; the curve keeps
-            // its measured shape. All of it is stated in the notes.
-            const fitTotal = stats.total_degrees;
-            const cycleTotal = Math.abs(Number(snap.total_degrees));
-            const scale = fitTotal > 0 ? cycleTotal / fitTotal : 1;
-            stats.total_degrees = cycleTotal;
+            const scale = fitTotal > 0 ? primaryTotal / fitTotal : 1;
+            stats.total_degrees = primaryTotal;
             stats.peak_rate = stats.peak_rate * scale;
-            stats.avg_rate = stats.airtime_s > 0 ? cycleTotal / stats.airtime_s : 0;
+            stats.avg_rate = stats.airtime_s > 0 ? primaryTotal / stats.airtime_s : 0;
             stats.method = "completed facing cycle + yaw curve";
-            run.notes.push(`Total from the completed facing cycle: ${snap.rule || "facing progression shows a completed turn"}. The per-frame yaw curve read ${Math.round(fitTotal)}° and its rates were scaled to the cycle total; the curve shape is as measured.`);
-            run.verification = {
-              trick: pose.trick, direction: pose.direction,
-              total_degrees: cycleTotal,
-              confidence: pose.confidence,
-              reason: (pose.reason || "") + ` Completed-cycle total ${Math.round(cycleTotal)}° from the facing progression; yaw curve fit ${Math.round(fitTotal)}°; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.`,
-              agreement: pdata.agreement || "UNVERIFIED",
-            };
+            for (const f of run.frames) if (f.cum_deg != null) f.cum_deg = f.cum_deg * scale;
+            run.notes.push(`Total from the completed facing cycle: ${snap.rule || "facing progression shows a completed turn"}. The per-frame yaw curve read ${Math.round(fitTotal)}° and its rates and curve were scaled to the cycle total; the curve shape is as measured.`);
           } else {
-            run.verification = {
-              trick: pose.trick, direction: pose.direction,
-              total_degrees: Math.abs(bucket.total_degrees),
-              confidence: pose.confidence,
-              reason: (pose.reason || "") + ` Facing-progression total ${Math.round(Math.abs(bucket.total_degrees))}° from the coarse facings; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.`,
-              agreement: pdata.agreement || "UNVERIFIED",
-            };
+            const scale = fitTotal > 0 ? primaryTotal / fitTotal : 1;
+            stats.total_degrees = primaryTotal;
+            stats.peak_rate = stats.peak_rate * scale;
+            stats.avg_rate = stats.airtime_s > 0 ? primaryTotal / stats.airtime_s : 0;
+            stats.method = "facing progression + yaw curve";
+            for (const f of run.frames) if (f.cum_deg != null) f.cum_deg = f.cum_deg * scale;
+            run.notes.push(`Total from the facing progression: net ${Math.round(Math.abs(bucket.total_degrees))}° across the kept facings. The per-frame yaw curve read ${Math.round(fitTotal)}° and its rates and curve were scaled to the facing total; the curve shape is as measured.`);
           }
+          run.verification = {
+            trick: pose.trick, direction: pose.direction,
+            total_degrees: primaryTotal,
+            confidence: pose.confidence,
+            reason: (pose.reason || "") + (snap ? ` Completed-cycle total ${Math.round(primaryTotal)}° from the facing progression; yaw curve fit ${Math.round(fitTotal)}°; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.` : ` Facing-progression total ${Math.round(primaryTotal)}° from the coarse facings; yaw curve fit ${Math.round(fitTotal)}°; Spark's own total ${Math.round(Number(pose.total_degrees) || 0)}°.`),
+            agreement: verdictForBucket({ fitTotal, fitDirection: stats.direction, bucket, snap, poseConfidence: pose.confidence }),
+          };
         } else {
           run.verification = {
             trick: pose.trick || "Unknown", direction: pose.direction || "unknown",
