@@ -1274,6 +1274,9 @@ async function runAutoScan() {
             agreement: verdictForBucket({ fitTotal, fitDirection: stats.direction, bucket, snap, poseConfidence: pose.confidence }),
           };
         } else {
+          if (Array.isArray(bucket.sequence)) {
+            run.notes.push(`Facing progression: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident frames, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
+          }
           run.verification = {
             trick: pose.trick || "Unknown", direction: pose.direction || "unknown",
             total_degrees: Number(pose.total_degrees) || 0,

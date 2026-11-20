@@ -380,11 +380,39 @@ export function bucketCycleTotal(entries) {
   }
   let cumulative = 0, prev = null, reversals = 0;
   const angles = kept.map((e) => POSE_BUCKET_ANGLE[e.facing]);
-  for (const a of angles) {
+  const times = kept.map((e) => Number(e.time));
+  // Median frame gap, for the jump guard below. Entries without times
+  // leave the guard inert (dt comparisons against NaN are false).
+  const gaps = [];
+  for (let i = 1; i < times.length; i++) {
+    const g = times[i] - times[i - 1];
+    if (Number.isFinite(g) && g > 0) gaps.push(g);
+  }
+  gaps.sort((a, b) => a - b);
+  const medianGap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : NaN;
+  for (let i = 0; i < angles.length; i++) {
+    const a = angles[i];
     if (prev == null) { prev = a; continue; }
     let d = a - prev;
     while (d > 180) d -= 360;
     while (d < -180) d += 360;
+    // Jump guard: a step over 120° between two adjacent frames is not
+    // a spin — it is a misread. A real spin moves through adjacent
+    // 90° buckets (~45–90° per frame at this sampling); skipping a
+    // whole bucket in one interval would need a sustained rate no
+    // trick here approaches. (Nov 20: on a real 180 the progression
+    // jumped front→back, +180° in one step, and the unwrap then forced
+    // the total to 450° and the snap to 540°.) A big step spanning a
+    // long gap (frames dropped as unknown in between) is allowed — the
+    // rider may have passed through the middle bucket unobserved.
+    const dt = times[i] - times[i - 1];
+    if (Math.abs(d) > 120 && Number.isFinite(dt) && Number.isFinite(medianGap) && dt <= 2 * medianGap) {
+      return {
+        error: `Facing jumps ${Math.round(d)}° between two adjacent frames — no steady spin to measure.`,
+        sequence: kept.map((e) => e.facing),
+        kept: kept.length,
+      };
+    }
     cumulative += d;
     prev = a;
   }
@@ -400,7 +428,11 @@ export function bucketCycleTotal(entries) {
     prev = a;
   }
   if (reversals > 90) {
-    return { error: `Facing progression reverses by ${Math.round(reversals)}° — no steady spin to measure.` };
+    return {
+      error: `Facing progression reverses by ${Math.round(reversals)}° — no steady spin to measure.`,
+      sequence: kept.map((e) => e.facing),
+      kept: kept.length,
+    };
   }
   return {
     total_degrees: net,
