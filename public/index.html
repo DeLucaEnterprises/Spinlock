@@ -860,27 +860,41 @@ function verdictForBucket({ fitTotal, fitDirection, bucket, snap, poseConfidence
  * Returns { pose, bucket, snap, primary_total, secondAgreed,
  * secondSequence, secondKept } or null when neither read returned a pose.
  */
-function combinePoseReads(a, b) {
+function combinePoseReads(a, b, fitDirection) {
   const has = (x) => x && x.pose && !x.__poseFailed;
   const clean = (x) => has(x) && x.bucket && !x.bucket.error && Number.isFinite(Number(x.primary_total));
   const totalOf = (x) => Math.abs(Number(x.primary_total));
+  const sameDir = (x, y) => {
+    const xCW = typeof x === "string" && x.startsWith("clockwise");
+    const xCCW = typeof x === "string" && x.startsWith("counter");
+    const yCW = typeof y === "string" && y.startsWith("clockwise");
+    const yCCW = typeof y === "string" && y.startsWith("counter");
+    return !((xCW && yCCW) || (xCCW && yCW));
+  };
   if (has(a) && has(b)) {
     if (clean(a) && clean(b)) {
-      const dirA = a.bucket.direction, dirB = b.bucket.direction;
-      const dirOk = (x, y) => {
-        const xCW = typeof x === "string" && x.startsWith("clockwise");
-        const xCCW = typeof x === "string" && x.startsWith("counter");
-        const yCW = typeof y === "string" && y.startsWith("clockwise");
-        const yCCW = typeof y === "string" && y.startsWith("counter");
-        return !((xCW && yCCW) || (xCCW && yCW));
-      };
-      if (totalOf(a) === totalOf(b) && dirOk(dirA, dirB)) {
+      if (totalOf(a) === totalOf(b) && sameDir(a.bucket.direction, b.bucket.direction)) {
         return { pose: a.pose, bucket: a.bucket, snap: a.snap || null, primary_total: a.primary_total, secondAgreed: true, secondSequence: b.bucket.sequence, secondKept: b.bucket.kept };
+      }
+      // Same total, opposite directions: the reads disagree about which
+      // side the rider passed through (left vs right mid-flight is a
+      // genuinely hard call on a side-on rider). The yaw curve's
+      // direction — from 10 per-frame estimates, not one bucket call —
+      // settles it: use the read it agrees with. If it agrees with
+      // neither, the direction is genuinely unresolved.
+      if (totalOf(a) === totalOf(b)) {
+        const useA = sameDir(fitDirection, a.bucket.direction) && !sameDir(fitDirection, b.bucket.direction);
+        const useB = sameDir(fitDirection, b.bucket.direction) && !sameDir(fitDirection, a.bucket.direction);
+        if (useA || useB) {
+          const pick = useA ? a : b;
+          const other = useA ? b : a;
+          return { pose: pick.pose, bucket: pick.bucket, snap: pick.snap || null, primary_total: pick.primary_total, secondAgreed: false, directionTiebreak: true, secondSequence: other.bucket.sequence, secondKept: other.bucket.kept, secondDirection: other.bucket.direction };
+        }
       }
       return {
         pose: a.pose,
         bucket: {
-          error: `Two facing reads disagree (${Math.round(totalOf(a))}° vs ${Math.round(totalOf(b))}°) — no steady spin to measure.`,
+          error: `Two facing reads disagree (${Math.round(totalOf(a))}° ${a.bucket.direction || ""} vs ${Math.round(totalOf(b))}° ${b.bucket.direction || ""}) — no steady spin to measure.`,
           sequence: a.bucket.sequence, kept: a.bucket.kept,
         },
         snap: null, primary_total: null, secondAgreed: false,
@@ -1329,7 +1343,7 @@ async function runAutoScan() {
       // agree on the total before it locks; a disagreement is no
       // measurement at all. combinePoseReads returns null when neither
       // read returned a pose.
-      const pdata = combinePoseReads(await posePromise, await posePromise2) || {};
+      const pdata = combinePoseReads(await posePromise, await posePromise2, stats.direction) || {};
       if (pdata.__poseFailed) throw new Error(pdata.__poseError || "pose request failed");
       if (pdata.pose) {
         const pose = pdata.pose;
@@ -1341,6 +1355,7 @@ async function runAutoScan() {
           const fitTotal = stats.total_degrees;
           run.notes.push(`Facing progression: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident frames, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
           if (pdata.secondAgreed) run.notes.push(`Second facing read (offset frames) agreed: ${Array.isArray(pdata.secondSequence) ? pdata.secondSequence.map((f) => facingWords[f] || f).join(" → ") : "same total"} (${pdata.secondKept} confident frames).`);
+          else if (pdata.directionTiebreak) run.notes.push(`Second facing read disagreed on direction (${pdata.secondDirection || "unknown"} vs ${bucket.direction}); the yaw curve's direction (${stats.direction}) settled it in favor of the ${bucket.direction} read.`);
           else if (Array.isArray(pdata.secondSequence)) run.notes.push(`Second facing read (offset frames) did not corroborate the first: ${pdata.secondSequence.map((f) => facingWords[f] || f).join(" → ")} (${pdata.secondKept} confident frames).`);
           if (snap && Number.isFinite(Number(snap.total_degrees))) {
             const scale = fitTotal > 0 ? primaryTotal / fitTotal : 1;
