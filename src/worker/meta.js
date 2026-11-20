@@ -583,6 +583,14 @@ export function bucketVerdict({ fitTotal, fitDirection, bucket, snap, poseConfid
   if (!Number.isFinite(net)) return "UNVERIFIED";
   if (!sameSpinDirection(fitDirection, bucket.direction)) return "DISPUTED";
   if (!Number.isFinite(fitTotal)) return "CLOSE";
+  // Ambiguous cycle: when the fit sits near the midpoint between the
+  // bucket net and the next multiple of 180, the two disagree about
+  // whether a full turn happened — and the bucket net is one misread
+  // landing frame away from the other total. (Nov 20: the real 360
+  // read net 180 with fit 263 — almost exactly the 270 midpoint — and
+  // LOCKED a wrong 180 at 75%.) Cap at CLOSE, never LOCKED.
+  const midpoint = net + 90;
+  if (Math.abs(Math.abs(fitTotal) - midpoint) <= 60) return "CLOSE";
   const diff = Math.abs(Math.abs(fitTotal) - net);
   if (diff <= 120 && poseConfidence >= 0.3) return "LOCKED";
   if (diff <= 360) return "CLOSE";

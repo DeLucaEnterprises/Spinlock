@@ -301,7 +301,7 @@
   </section>
 
   <footer>
-    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code. The facing progression is the total: when it shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180°. The per-frame yaw curve is a fragile corroborator (on one real 180 it read 485° while the facing progression said 180°), so its rates and curve are scaled to the facing total, and the run notes always show the facing progression and the fit value. <b>LOCKED</b> means the facing progression and the curve fit confirm the same trick (within 120°, same direction, confident), or the completed-cycle rule fired with the fit in the same ballpark. <b>CLOSE</b> means the facing total stands but the fit disagrees beyond 120° (up to a full turn). <b>DISPUTED</b> means opposite directions or disagreement over a full turn. <b>UNVERIFIED</b> means the facing progression could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
+    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code — and a second facing read on offset frames must agree on that total before it locks, because the landing facing is the fragile judgement. The facing progression is the total: when it shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180°. The per-frame yaw curve is a fragile corroborator (on one real 180 it read 485° while the facing progression said 180°), so its rates and curve are scaled to the facing total, and the run notes always show the facing progression and the fit value. <b>LOCKED</b> means the facing progression and the curve fit confirm the same trick (within 120°, same direction, confident), or the completed-cycle rule fired with the fit in the same ballpark, with both facing reads agreeing. <b>CLOSE</b> means the facing total stands but the fit disagrees beyond 120° (up to a full turn), or the fit sits halfway between two totals so the cycle count is ambiguous. <b>DISPUTED</b> means opposite directions, disagreement over a full turn, or the two facing reads disagree. <b>UNVERIFIED</b> means the facing progression could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
     <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs.
   </footer>
 </div>
@@ -833,10 +833,70 @@ function verdictForBucket({ fitTotal, fitDirection, bucket, snap, poseConfidence
   if (!Number.isFinite(net)) return "UNVERIFIED";
   if (!dirOk(fitDirection, bucket.direction)) return "DISPUTED";
   if (!Number.isFinite(fitTotal)) return "CLOSE";
+  // Ambiguous cycle: when the fit sits near the midpoint between the
+  // bucket net and the next multiple of 180, the two disagree about
+  // whether a full turn happened. (Nov 20: the real 360 read net 180
+  // with fit 263 — almost exactly the 270 midpoint — and LOCKED a wrong
+  // 180 at 75%.) Cap at CLOSE, never LOCKED.
+  const midpoint = net + 90;
+  if (Math.abs(Math.abs(fitTotal) - midpoint) <= 60) return "CLOSE";
   const diff = Math.abs(Math.abs(fitTotal) - net);
   if (diff <= 120 && poseConfidence >= 0.3) return "LOCKED";
   if (diff <= 360) return "CLOSE";
   return "DISPUTED";
+}
+
+/**
+ * Combine two independent /api/pose reads of the same trick — one on
+ * the main window frames, one on offset frames (half an interval
+ * shifted, so the model sees different crops of the same spin). The
+ * landing facing is the fragile judgement: on the real 360 the main
+ * read's last frames flipped from "back" to "right" between runs,
+ * dropping the net from 270° to 180° and LOCKING a wrong 180. Two
+ * reads that agree on the total (after the completed-cycle snap) are
+ * one corroborated measurement; two that disagree about the total are
+ * no measurement at all. A read that merely failed or was inconclusive
+ * does not veto the other one — it just does not corroborate it.
+ * Returns { pose, bucket, snap, primary_total, secondAgreed,
+ * secondSequence, secondKept } or null when neither read returned a pose.
+ */
+function combinePoseReads(a, b) {
+  const has = (x) => x && x.pose && !x.__poseFailed;
+  const clean = (x) => has(x) && x.bucket && !x.bucket.error && Number.isFinite(Number(x.primary_total));
+  const totalOf = (x) => Math.abs(Number(x.primary_total));
+  if (has(a) && has(b)) {
+    if (clean(a) && clean(b)) {
+      const dirA = a.bucket.direction, dirB = b.bucket.direction;
+      const dirOk = (x, y) => {
+        const xCW = typeof x === "string" && x.startsWith("clockwise");
+        const xCCW = typeof x === "string" && x.startsWith("counter");
+        const yCW = typeof y === "string" && y.startsWith("clockwise");
+        const yCCW = typeof y === "string" && y.startsWith("counter");
+        return !((xCW && yCCW) || (xCCW && yCW));
+      };
+      if (totalOf(a) === totalOf(b) && dirOk(dirA, dirB)) {
+        return { pose: a.pose, bucket: a.bucket, snap: a.snap || null, primary_total: a.primary_total, secondAgreed: true, secondSequence: b.bucket.sequence, secondKept: b.bucket.kept };
+      }
+      return {
+        pose: a.pose,
+        bucket: {
+          error: `Two facing reads disagree (${Math.round(totalOf(a))}° vs ${Math.round(totalOf(b))}°) — no steady spin to measure.`,
+          sequence: a.bucket.sequence, kept: a.bucket.kept,
+        },
+        snap: null, primary_total: null, secondAgreed: false,
+        secondSequence: b.bucket.sequence, secondKept: b.bucket.kept,
+      };
+    }
+    // One read clean, the other inconclusive: use the clean one, and
+    // say the second read did not corroborate it.
+    if (clean(a)) return { pose: a.pose, bucket: a.bucket, snap: a.snap || null, primary_total: a.primary_total, secondAgreed: false, secondSequence: (b.bucket && b.bucket.sequence) || null, secondKept: (b.bucket && b.bucket.kept) || 0 };
+    if (clean(b)) return { pose: b.pose, bucket: b.bucket, snap: b.snap || null, primary_total: b.primary_total, secondAgreed: false, secondSequence: (a.bucket && a.bucket.sequence) || null, secondKept: (a.bucket && a.bucket.kept) || 0 };
+    // Both inconclusive: return the first read's error (it carries a reason).
+    return { pose: a.pose, bucket: a.bucket, snap: null, primary_total: null, secondAgreed: false, secondSequence: (b.bucket && b.bucket.sequence) || null, secondKept: (b.bucket && b.bucket.kept) || 0 };
+  }
+  if (has(a)) return { pose: a.pose, bucket: a.bucket, snap: a.snap || null, primary_total: a.primary_total, secondAgreed: false, secondSequence: null, secondKept: 0 };
+  if (has(b)) return { pose: b.pose, bucket: b.bucket, snap: b.snap || null, primary_total: b.primary_total, secondAgreed: false, secondSequence: null, secondKept: 0 };
+  return null;
 }
 
 /**
@@ -1024,7 +1084,7 @@ function cropRiderImage(dataUrl, box) {
 }
 
 
-async function extractFramesInRange(video, start, end, fps, maxFrames, signal, onProgress, targetWidth) {
+async function extractFramesInRange(video, start, end, fps, maxFrames, signal, onProgress, targetWidth, phase) {
   const duration = video.duration;
   const s = Math.max(0, start), e = Math.min(duration, Math.max(s + 0.2, end));
   const count = Math.max(2, Math.min(maxFrames, Math.floor((e - s) * fps) + 1));
@@ -1038,7 +1098,10 @@ async function extractFramesInRange(video, start, end, fps, maxFrames, signal, o
   const frames = [];
   for (let i = 0; i < count; i++) {
     if (signal.aborted) throw new DOMException("Scan cancelled.", "AbortError");
-    const t = s + (i / Math.max(1, count - 1)) * (e - s);
+    // phase shifts the sample grid by a fraction of one interval
+    // (0.5 = the midpoints between the main frames), so a second read
+    // sees different crops of the same trick instead of the same ones.
+    const t = phase ? s + ((i + phase) / count) * (e - s) : s + (i / Math.max(1, count - 1)) * (e - s);
     await seekTo(video, t);
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     let dataUrl;
@@ -1135,14 +1198,18 @@ async function runAutoScan() {
     // Window frames at up to 960 wide: SAM boxes and rider crops need the
     // resolution — at 480 the rider is ~60px tall and facing is unreadable.
     windowFrames = await extractFramesInRange(clipVideo, windowInfo.window.start, windowInfo.window.end, fps, 10, signal, (d, t) => setClipProgress("Extracting frames in the trick window…", d, t, startedAt), 960);
+    // Offset frames: the same window sampled half an interval later, so
+    // the second facing read sees different crops of the same spin.
+    const offsetFrames = await extractFramesInRange(clipVideo, windowInfo.window.start, windowInfo.window.end, fps, 10, signal, (d, t) => setClipProgress("Extracting offset frames for the second facing read…", d, t, startedAt), 960, 0.5);
 
     // Board lock and rider lock are independent SAM passes over the same
     // frames, so they run in parallel — two sequential passes were a
-    // third of the old run time.
+    // third of the old run time. The offset rider pass runs with them.
     setClipProgress("SAM 3.1 is locking onto the board and rider…", 0, windowFrames.length, startedAt);
-    const [analyzed, riderScanned] = await Promise.all([
+    const [analyzed, riderScanned, offsetRiderScanned] = await Promise.all([
       samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is locking onto the board and rider…", d, t, startedAt)),
       samOverFrames(windowFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is locking onto the board and rider…", d, t, startedAt), "snowboarder"),
+      samOverFrames(offsetFrames, signal, "/api/analyze", (d, t) => setClipProgress("SAM 3.1 is locking onto the board and rider…", d, t, startedAt), "snowboarder"),
     ]);
     if (analyzed.sam_errors > 0) run.notes.push(`SAM model errors on ${analyzed.sam_errors} window frame(s) — counted separately from no-board frames.`);
     const byIndex = new Map(analyzed.results.map((r) => [r.index, r]));
@@ -1164,6 +1231,19 @@ async function runAutoScan() {
       crops.push({ index: f.index, time: f.time, image: await cropRiderImage(f.image, box) });
     }
     if (cropFallbacks > 0) run.notes.push(`${cropFallbacks} frame(s) had no rider box, so those measurements used the full frame instead of a crop.`);
+    // Offset crops for the second facing read (same rider-lock logic on
+    // the offset frames).
+    if (offsetRiderScanned.sam_errors > 0) run.notes.push(`SAM model errors on ${offsetRiderScanned.sam_errors} offset rider-lock frame(s).`);
+    const offsetRiderByIndex = new Map(offsetRiderScanned.results.map((r) => [r.index, r]));
+    const offsetCrops = [];
+    let offsetCropFallbacks = 0;
+    for (const f of offsetFrames) {
+      const rb = offsetRiderByIndex.get(f.index);
+      const box = rb && rb.found ? rb.box : null;
+      if (!box) offsetCropFallbacks++;
+      offsetCrops.push({ index: f.index, time: f.time, image: await cropRiderImage(f.image, box) });
+    }
+    if (offsetCropFallbacks > 0) run.notes.push(`${offsetCropFallbacks} offset frame(s) had no rider box, so the second facing read used the full frame for those.`);
 
     // Rotation from the yaw sequence on CROPS, and the facing cross-check
     // on the same crops — fired in parallel, because the two Spark calls
@@ -1177,6 +1257,13 @@ async function runAutoScan() {
     const posePromise = fetch("/api/pose", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ frames: crops.map((c) => ({ index: c.index, time: c.time, image: c.image })) }),
+      signal,
+    }).then((r) => r.json().catch(() => ({}))).catch((e) => ({ __poseFailed: true, __poseError: e && e.message ? e.message : String(e) }));
+    // Second facing read on the offset crops, in parallel with the
+    // first — the two reads must agree on the total before it locks.
+    const posePromise2 = fetch("/api/pose", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ frames: offsetCrops.map((c) => ({ index: c.index, time: c.time, image: c.image })) }),
       signal,
     }).then((r) => r.json().catch(() => ({}))).catch((e) => ({ __poseFailed: true, __poseError: e && e.message ? e.message : String(e) }));
     const sres = await fetch("/api/sequence", {
@@ -1238,7 +1325,11 @@ async function runAutoScan() {
     // straight tiles on the real 360 clip.)
     setClipProgress("Muse Spark is judging the facing…", 0, 0, startedAt);
     try {
-      const pdata = await posePromise;
+      // Two independent reads (main + offset frames) combined: they must
+      // agree on the total before it locks; a disagreement is no
+      // measurement at all. combinePoseReads returns null when neither
+      // read returned a pose.
+      const pdata = combinePoseReads(await posePromise, await posePromise2) || {};
       if (pdata.__poseFailed) throw new Error(pdata.__poseError || "pose request failed");
       if (pdata.pose) {
         const pose = pdata.pose;
@@ -1249,6 +1340,8 @@ async function runAutoScan() {
           const primaryTotal = Math.abs(Number(pdata.primary_total));
           const fitTotal = stats.total_degrees;
           run.notes.push(`Facing progression: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident frames, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
+          if (pdata.secondAgreed) run.notes.push(`Second facing read (offset frames) agreed: ${Array.isArray(pdata.secondSequence) ? pdata.secondSequence.map((f) => facingWords[f] || f).join(" → ") : "same total"} (${pdata.secondKept} confident frames).`);
+          else if (Array.isArray(pdata.secondSequence)) run.notes.push(`Second facing read (offset frames) did not corroborate the first: ${pdata.secondSequence.map((f) => facingWords[f] || f).join(" → ")} (${pdata.secondKept} confident frames).`);
           if (snap && Number.isFinite(Number(snap.total_degrees))) {
             const scale = fitTotal > 0 ? primaryTotal / fitTotal : 1;
             stats.total_degrees = primaryTotal;
@@ -1276,6 +1369,9 @@ async function runAutoScan() {
         } else {
           if (Array.isArray(bucket.sequence)) {
             run.notes.push(`Facing progression: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident frames, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
+          }
+          if (Array.isArray(pdata.secondSequence)) {
+            run.notes.push(`Second facing read (offset frames): ${pdata.secondSequence.map((f) => facingWords[f] || f).join(" → ")} (${pdata.secondKept} confident frames).`);
           }
           run.verification = {
             trick: pose.trick || "Unknown", direction: pose.direction || "unknown",
