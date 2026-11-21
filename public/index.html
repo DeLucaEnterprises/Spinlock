@@ -302,7 +302,7 @@
 
   <footer>
     <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code — and a second facing read on offset frames must agree on that total before it locks, because the landing facing is the fragile judgement. The facing progression is the total: when it shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180°. The per-frame yaw curve is a fragile corroborator (on one real 180 it read 485° while the facing progression said 180°), so its rates and curve are scaled to the facing total, and the run notes always show the facing progression and the fit value. When the facing cannot confirm a total and the yaw steps collapse late in the window — the model losing the facing once the rider's back is presented on a fast spin — the total falls back to the peak spin rate times the airtime (a rate rescue, Nov 20: a real frontside 540 read 326° by the fit while its peak rate of 287°/s over 1.84s of air implies 528°); a rate-rescued total caps at CLOSE, never LOCKED. <b>LOCKED</b> means the facing progression and the curve fit confirm the same trick (within 120°, same direction, confident), or the completed-cycle rule fired with the fit in the same ballpark, with both facing reads agreeing. <b>CLOSE</b> means the facing total stands but the fit disagrees beyond 120° (up to a full turn), or the fit sits halfway between two totals so the cycle count is ambiguous. <b>DISPUTED</b> means opposite directions, disagreement over a full turn, or the two facing reads disagree. <b>UNVERIFIED</b> means the facing progression could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
-    <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs. SPINLOCK build v3.6.
+    <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs. SPINLOCK build v3.6.1.
   </footer>
 </div>
 <script>
@@ -893,6 +893,26 @@ function rescueTrickName(poseTrick, rescueTotal) {
 }
 
 /**
+ * Verification object for the inconclusive-facing branch. When the
+ * facing cannot confirm a total, the trick line must NOT show the
+ * pose's own (unreliable) trick and total as the cross-check: on a
+ * real 180 the pose guessed "540" and the line read "540 · unknown ·
+ * Cross-check total 540°" under a correct 178° headline. The
+ * cross-check total is the measured fit total and the trick is
+ * Unknown; the pose's own words stay in the reason text.
+ */
+function inconclusiveVerification({ pose, fitTotal, fitDirection, bucketError }) {
+  return {
+    trick: "Unknown",
+    direction: (pose && pose.direction) || fitDirection || "unknown",
+    total_degrees: Number.isFinite(fitTotal) ? fitTotal : 0,
+    confidence: (pose && pose.confidence) || 0,
+    reason: ((pose && pose.reason) || "") + " Facing progression was inconclusive: " + (bucketError || "unknown bucket error") + ".",
+    agreement: "UNVERIFIED",
+  };
+}
+
+/**
  * Combine two independent /api/pose reads of the same trick — one on
  * the main window frames, one on offset frames (half an interval
  * shifted, so the model sees different crops of the same spin). The
@@ -1451,13 +1471,7 @@ async function runAutoScan() {
           if (Array.isArray(pdata.secondSequence)) {
             run.notes.push(`Second facing read (offset frames): ${pdata.secondSequence.map((f) => facingWords[f] || f).join(" → ")} (${pdata.secondKept} confident frames).`);
           }
-          run.verification = {
-            trick: pose.trick || "Unknown", direction: pose.direction || "unknown",
-            total_degrees: Number(pose.total_degrees) || 0,
-            confidence: pose.confidence || 0,
-            reason: (pose.reason || "") + " Facing progression was inconclusive: " + (bucket.error || "unknown bucket error") + ".",
-            agreement: "UNVERIFIED",
-          };
+          run.verification = inconclusiveVerification({ pose, fitTotal: stats.fit_total_raw, fitDirection: stats.direction, bucketError: bucket.error });
           run.notes.push("Facing cross-check inconclusive: " + (bucket.error || "unknown bucket error") + ". Measured stats above are still real; the trick call stays unverified.");
         }
       } else {
