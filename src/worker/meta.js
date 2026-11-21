@@ -403,10 +403,16 @@ export function bucketCycleTotal(entries) {
     // trick here approaches. (Nov 20: on a real 180 the progression
     // jumped front→back, +180° in one step, and the unwrap then forced
     // the total to 450° and the snap to 540°.) A big step spanning a
-    // long gap (frames dropped as unknown in between) is allowed — the
-    // rider may have passed through the middle bucket unobserved.
+    // LONG gap (more than 3 frame intervals — three or more frames dropped
+    // as unknown in between) is allowed, because the rider may have
+    // passed through the middle bucket unobserved. A gap of 3 intervals
+    // or fewer is NOT enough: at the spin rates here (~60–140°/s) the
+    // rider needs over a second to cross a 90° bucket, so a +180° jump
+    // across one or two dropped frames is still a misread. (Nov 20,
+    // second case: a +180° jump across one dropped frame unwrapped a
+    // real 180 to a 360° total.)
     const dt = times[i] - times[i - 1];
-    if (Math.abs(d) > 120 && Number.isFinite(dt) && Number.isFinite(medianGap) && dt <= 2 * medianGap) {
+    if (Math.abs(d) > 120 && Number.isFinite(dt) && Number.isFinite(medianGap) && dt <= 3 * medianGap) {
       return {
         error: `Facing jumps ${Math.round(d)}° between two adjacent frames — no steady spin to measure.`,
         sequence: kept.map((e) => e.facing),
