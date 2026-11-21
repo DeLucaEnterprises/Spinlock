@@ -301,8 +301,8 @@
   </section>
 
   <footer>
-    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code — and a second facing read on offset frames must agree on that total before it locks, because the landing facing is the fragile judgement. The facing progression is the total: when it shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180°. The per-frame yaw curve is a fragile corroborator (on one real 180 it read 485° while the facing progression said 180°), so its rates and curve are scaled to the facing total, and the run notes always show the facing progression and the fit value. <b>LOCKED</b> means the facing progression and the curve fit confirm the same trick (within 120°, same direction, confident), or the completed-cycle rule fired with the fit in the same ballpark, with both facing reads agreeing. <b>CLOSE</b> means the facing total stands but the fit disagrees beyond 120° (up to a full turn), or the fit sits halfway between two totals so the cycle count is ambiguous. <b>DISPUTED</b> means opposite directions, disagreement over a full turn, or the two facing reads disagree. <b>UNVERIFIED</b> means the facing progression could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
-    <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs. SPINLOCK build v3.5.
+    <b>How SPINLOCK measures.</b> Frames are extracted in your browser. Takeoff/landing come from judging board-to-snow contact frame by frame — that works on follow-cam footage, where board height in the frame cannot, because the camera tilts with the rider. SAM 3.1 (Meta) segments the snowboard in each window frame to confirm the board lock, and segments the rider to crop in tight: facing is judged on enlarged rider crops, not on tiny full frames. Rotation comes from the rider's facing two ways: Muse Spark 1.3 (Meta) estimates the facing (yaw) in each crop, unwrapped and fit to a steady spin curve for the rotation curve and spin rates; and a separate facing call judges coarse facing (front / right / back / left) on the same crops as separate images, turned into a rotation total in code — and a second facing read on offset frames must agree on that total before it locks, because the landing facing is the fragile judgement. The facing progression is the total: when it shows a completed turn — all four facings visited in order — the total follows the completed-cycle rule, because spins land in multiples of 180°. The per-frame yaw curve is a fragile corroborator (on one real 180 it read 485° while the facing progression said 180°), so its rates and curve are scaled to the facing total, and the run notes always show the facing progression and the fit value. When the facing cannot confirm a total and the yaw steps collapse late in the window — the model losing the facing once the rider's back is presented on a fast spin — the total falls back to the peak spin rate times the airtime (a rate rescue, Nov 20: a real frontside 540 read 326° by the fit while its peak rate of 287°/s over 1.84s of air implies 528°); a rate-rescued total caps at CLOSE, never LOCKED. <b>LOCKED</b> means the facing progression and the curve fit confirm the same trick (within 120°, same direction, confident), or the completed-cycle rule fired with the fit in the same ballpark, with both facing reads agreeing. <b>CLOSE</b> means the facing total stands but the fit disagrees beyond 120° (up to a full turn), or the fit sits halfway between two totals so the cycle count is ambiguous. <b>DISPUTED</b> means opposite directions, disagreement over a full turn, or the two facing reads disagree. <b>UNVERIFIED</b> means the facing progression could not confirm a trick — including when both totals are 0°. No rotation, takeoff, or landing value is ever invented or filled in.
+    <br><b>Limits, honestly.</b> One camera gives a 2D view — a board seen edge-on or hidden by spray can be missed or misread, which is why board-found rate and the Spark check are always shown. Direct video links need CORS permission from their host. Platform watch pages (YouTube, Vimeo, social) cannot be frame-sampled in a browser. Built for the Cloudflare × U.S. Ski &amp; Snowboard Challenge 1 (Snowboard Rotation Analysis). Meta API key stays server-side as a Worker secret and is never in the browser, the repo, or logs. SPINLOCK build v3.6.
   </footer>
 </div>
 <script>
@@ -847,6 +847,52 @@ function verdictForBucket({ fitTotal, fitDirection, bucket, snap, poseConfidence
 }
 
 /**
+ * Rate rescue: recover a spin the facing measurement lost. On a fast
+ * spin the model tracks the facing while the rider's chest is visible,
+ * then loses it once the rider's back is presented and the chest is
+ * hidden — the per-frame yaw steps collapse in the second half of the
+ * window while the peak step (from the well-tracked early frames) still
+ * reflects the true spin rate. (Nov 20, real frontside 540: yaw steps
+ * 65, 20, 45, 35, 65, 20, 15, 20, 60 — peak step 65, second-half
+ * median 20; peak rate 287°/s over 1.84s of air implies 528° while
+ * the fit read 326° and the two facing reads disagreed 360 vs 180.)
+ * The rescue fires only when ALL of these hold: the facing did NOT
+ * produce a clean primary total, the second-half median step is under
+ * 45% of the peak step, and peak rate × airtime exceeds the fit by at
+ * least 120°. The ratio threshold (0.45) separates the 540 (0.31)
+ * from the real 360 (0.57) and 180 (0.80) — it is tuned on three
+ * clips, so the rescue NEVER locks: the caller caps its verdict at
+ * CLOSE. Returns { total_degrees, peak_rate, airtime_s, late_median,
+ * peak_step } or null. steps are absolute per-frame yaw step sizes in
+ * degrees, in time order.
+ */
+function rateRescue({ fitTotal, peakRate, airtime, steps, facingClean }) {
+  if (facingClean) return null;
+  if (!Number.isFinite(fitTotal) || !Number.isFinite(peakRate) || !Number.isFinite(airtime) || airtime <= 0) return null;
+  if (!Array.isArray(steps) || steps.length < 5) return null;
+  const peakStep = Math.max(...steps);
+  if (!(peakStep > 0)) return null;
+  const secondHalf = steps.slice(Math.ceil(steps.length / 2));
+  if (secondHalf.length < 2) return null;
+  const sorted = [...secondHalf].sort((a, b) => a - b);
+  const lateMedian = sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  if (!(lateMedian < 0.45 * peakStep)) return null;
+  const implied = peakRate * airtime;
+  if (!(implied > fitTotal + 120)) return null;
+  return { total_degrees: Math.round(implied), peak_rate: peakRate, airtime_s: airtime, late_median: lateMedian, peak_step: peakStep };
+}
+
+/** Trick name for a rate rescue: keep the pose's frontside/backside
+ * word (the model gets the side right even when the number is wrong)
+ * and round the rescue total to the nearest multiple of 180, because
+ * spins land in multiples of 180. No word → "Unknown". */
+function rescueTrickName(poseTrick, rescueTotal) {
+  const m = typeof poseTrick === "string" ? poseTrick.match(/^(frontside|backside)/i) : null;
+  const n = Math.round(Number(rescueTotal) / 180) * 180;
+  return m ? `${m[1][0].toUpperCase()}${m[1].slice(1).toLowerCase()} ${n}` : "Unknown";
+}
+
+/**
  * Combine two independent /api/pose reads of the same trick — one on
  * the main window frames, one on offset frames (half an interval
  * shifted, so the model sees different crops of the same spin). The
@@ -1306,6 +1352,15 @@ async function runAutoScan() {
     if (fitted.error) throw new Error(fitted.error);
     const stats = fitted.stats;
     stats.method = "rider-crop yaw + facing cross-check";
+    // The raw fit total, kept before any scaling: the trick line's
+    // "curve fit" figure must show the fit as measured, not the total
+    // after it was scaled to a facing or rescue total. (Nov 20: the
+    // line showed the scaled total as the "curve fit" figure.)
+    stats.fit_total_raw = stats.total_degrees;
+    // Per-frame yaw step sizes (from the kept, unwrapped curve points,
+    // before any scaling) for the rate rescue below.
+    const yawSteps = [];
+    for (let i = 1; i < fitted.kept.length; i++) yawSteps.push(Math.abs(fitted.kept[i].cum_deg - fitted.kept[i - 1].cum_deg));
     const meanConf = points.reduce((a, p) => a + (p.confidence || 0), 0) / Math.max(1, points.length);
     run.notes.push(`Rotation from ${fitted.kept.length} yaw estimate(s) on enlarged rider crops (mean confidence ${Math.round(meanConf * 100)}%) fit to a spin curve${fitted.dropped ? `; ${fitted.dropped} outlier(s) dropped` : ""}.`);
     const sparkOverall = Number(sdata.sequence.total_degrees);
@@ -1338,6 +1393,12 @@ async function runAutoScan() {
     // (An earlier contact-sheet format failed: it read "front" for 6
     // straight tiles on the real 360 clip.)
     setClipProgress("Muse Spark is judging the facing…", 0, 0, startedAt);
+    // Rate-rescue inputs (set inside the pose block): whether the
+    // facing produced a clean primary total, and the pose itself for
+    // the rescue's trick name. Declared here so the rescue below,
+    // which runs after the pose block, can read them.
+    let facingClean = false;
+    let rescuePose = null;
     try {
       // Two independent reads (main + offset frames) combined: they must
       // agree on the total before it locks; a disagreement is no
@@ -1347,10 +1408,12 @@ async function runAutoScan() {
       if (pdata.__poseFailed) throw new Error(pdata.__poseError || "pose request failed");
       if (pdata.pose) {
         const pose = pdata.pose;
+        rescuePose = pose;
         const bucket = pdata.bucket || {};
         const snap = pdata.snap || null;
         const facingWords = { toward_camera: "front", facing_right: "right", away_from_camera: "back", facing_left: "left", unknown: "?" };
         if (!bucket.error && Array.isArray(bucket.sequence) && pdata.primary_total != null) {
+          facingClean = true;
           const primaryTotal = Math.abs(Number(pdata.primary_total));
           const fitTotal = stats.total_degrees;
           run.notes.push(`Facing progression: ${bucket.sequence.map((f) => facingWords[f] || f).join(" → ")} (${bucket.kept} confident frames, pose confidence ${Math.round((pose.confidence || 0) * 100)}%).`);
@@ -1404,6 +1467,35 @@ async function runAutoScan() {
     } catch (perr) {
       run.verification = null;
       run.notes.push("Facing cross-check failed: " + (perr.message || String(perr)) + ". Measured stats above are still real; the trick call is honestly unverified.");
+    }
+
+    // Rate rescue (v3.6): when the facing measurement failed AND the
+    // yaw steps collapsed in the second half of the window, the fit
+    // total under-reads a fast spin — the peak spin rate (from the
+    // well-tracked early frames) times the airtime is the better total.
+    // It never locks: the verdict caps at CLOSE, because this is an
+    // inference from the spin rate, not a confirmed facing measurement.
+    const rescue = rateRescue({ fitTotal: stats.fit_total_raw, peakRate: stats.peak_rate, airtime: stats.airtime_s, steps: yawSteps, facingClean });
+    if (rescue) {
+      const rescueTotal = rescue.total_degrees;
+      const scale = stats.fit_total_raw > 0 ? rescueTotal / stats.fit_total_raw : 1;
+      stats.total_degrees = rescueTotal;
+      stats.avg_rate = stats.airtime_s > 0 ? rescueTotal / stats.airtime_s : 0;
+      stats.method = "peak spin rate × airtime (facing lost mid-spin)";
+      for (const f of run.frames) if (f.cum_deg != null) f.cum_deg = f.cum_deg * scale;
+      const poseTrick = rescuePose ? rescuePose.trick : null;
+      const poseDir = rescuePose ? (rescuePose.direction || stats.direction) : stats.direction;
+      const poseConf = rescuePose ? (rescuePose.confidence || 0) : 0;
+      const poseReason = rescuePose ? (rescuePose.reason || "") : "";
+      run.verification = {
+        trick: rescueTrickName(poseTrick, rescueTotal),
+        direction: poseDir,
+        total_degrees: rescueTotal,
+        confidence: poseConf,
+        reason: poseReason + ` Rate rescue: the facing cross-check could not confirm a total and the per-frame yaw steps collapsed in the second half of the window (second-half median step ${Math.round(rescue.late_median)}° vs peak step ${Math.round(rescue.peak_step)}°) — the model lost the facing once the rider's back was presented. Peak spin rate ${Math.round(rescue.peak_rate)}°/s over ${stats.airtime_s.toFixed(2)}s of air implies ${rescueTotal}°; the curve fit read ${Math.round(stats.fit_total_raw)}°. The total is the rate-implied value and the call caps at CLOSE.`,
+        agreement: "CLOSE",
+      };
+      run.notes.push(`Rate rescue: facing inconclusive and yaw steps collapsed late (median ${Math.round(rescue.late_median)}° vs peak ${Math.round(rescue.peak_step)}°), so the total is peak spin rate ${Math.round(rescue.peak_rate)}°/s × ${stats.airtime_s.toFixed(2)}s airtime = ${rescueTotal}°, not the curve fit ${Math.round(stats.fit_total_raw)}°. Verdict caps at CLOSE.`);
     }
 
     run.status = "complete";
@@ -1512,7 +1604,7 @@ function renderResult(run) {
     const v = run.verification;
     $("verdictDetail").innerHTML =
       `<b>${esc(v.trick || "Unknown")}</b> · ${esc(v.direction || "unknown")} · Cross-check total <b>${fmtDeg(v.total_degrees)}</b> ` +
-      `vs curve fit <b>${s ? fmtDeg(s.total_degrees) : "—"}</b> · confidence ${Math.round((v.confidence || 0) * 100)}%<br>${esc(v.reason || "")}`;
+      `vs curve fit <b>${s ? fmtDeg(s.fit_total_raw != null ? s.fit_total_raw : s.total_degrees) : "—"}</b> · confidence ${Math.round((v.confidence || 0) * 100)}%<br>${esc(v.reason || "")}`;
   } else {
     $("verdictDetail").textContent = run.status === "failed"
       ? ("No verification — run failed: " + (run.error || "unknown error"))
